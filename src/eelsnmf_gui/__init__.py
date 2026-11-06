@@ -1,6 +1,8 @@
+from importlib.metadata import PackageNotFoundError, version
+
 try:
-    from ._version import version as __version__
-except ImportError:
+    __version__ = version("eelsnmf-gui")
+except PackageNotFoundError:  # running from source without installation
     __version__ = "unknown"
 
 from ._results import (
@@ -16,8 +18,8 @@ from ._results import (
     ProcessFoldersResult,
     ProcessingResult,
 )
-from ._widget import EELSProcessingWidget
 from .session import Session
+from ._widget import EELSProcessingWidget
 
 __all__ = (
     "EELSProcessingWidget",

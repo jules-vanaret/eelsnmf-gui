@@ -1,6 +1,6 @@
 [project]
 name = "eelsnmf-gui"
-dynamic = ["version"]
+version = "0.0.2"
 description = "GUI for EELS NMF processing"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -44,7 +44,7 @@ dev = [
 
 
 [build-system]
-requires = ["setuptools>=42.0.0", "setuptools_scm"]
+requires = ["setuptools>=42.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
@@ -52,12 +52,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-
-[tool.setuptools_scm]
-write_to = "src/eelsnmf_gui/_version.py"
-fallback_version = "0.0.1"
-local_scheme = "no-local-version"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
