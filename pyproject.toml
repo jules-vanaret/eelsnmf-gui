@@ -1,6 +1,6 @@
 [project]
 name = "eelsnmf-gui"
-version = "0.0.3"
+version = "0.0.4"
 description = "GUI for EELS NMF processing"
 readme = "README.md"
 license = {file = "LICENSE"}
