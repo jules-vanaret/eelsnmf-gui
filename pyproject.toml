@@ -27,6 +27,8 @@ dependencies = [
     "numpy",
     "qtpy",
     "openpyxl",
+    "scikit-image",
+    "PyQt5",
     # "EELSNMF[EML] @ git+https://github.com/PauTorru/EELSNMF.git",
 ]
 
