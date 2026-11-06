@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Dict, List
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.ndimage import zoom
 
 from ._results import EdgeSeries

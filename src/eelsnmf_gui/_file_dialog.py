@@ -1,23 +1,29 @@
 import os
 
+from qtpy.QtCore import QDir, QEvent, Qt
+from qtpy.QtGui import QFileSystemModel
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QDialog,
-    QVBoxLayout,
     QHBoxLayout,
+    QLineEdit,
     QPushButton,
     QTreeView,
-    QAbstractItemView,
-    QLineEdit,
+    QVBoxLayout,
 )
-from qtpy.QtCore import QDir, QEvent, QItemSelectionModel, Qt
-from qtpy.QtGui import QFileSystemModel
 
 
 class MultiFolderDialog(QDialog):
-    """Dialog for selecting multiple folders with a path jump box."""
+    """Dialog for selecting multiple folders or one deco .pkl file.
+
+    Folders and ``*.pkl`` files are listed; everything else is hidden.
+    """
 
     def __init__(
-        self, parent=None, title="Select Source Folder(s)", start_dir=None
+        self,
+        parent=None,
+        title="Select Source Folder(s) or a deco file",
+        start_dir=None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -25,7 +31,9 @@ class MultiFolderDialog(QDialog):
         layout = QVBoxLayout(self)
 
         self.model = QFileSystemModel(self)
-        self.model.setFilter(QDir.Dirs | QDir.NoDotAndDotDot)
+        self.model.setFilter(QDir.Dirs | QDir.Files | QDir.NoDotAndDotDot)
+        self.model.setNameFilterDisables(False)
+        self.model.setNameFilters(["*.pkl"])
         self.model.setRootPath("")  # required for model to populate
 
         self.path_edit = QLineEdit(self)
@@ -113,8 +121,8 @@ class MultiFolderDialog(QDialog):
                 return True
         return super().eventFilter(source, event)
 
-    def selected_folders(self):
-        """Return selected folder paths, deduplicated in selection order."""
+    def selected_paths(self):
+        """Return selected paths (folders or one deco file), in order."""
         # Use column 0 so we get one index per row
         indexes = self.view.selectionModel().selectedRows(0)
         paths = []
@@ -130,3 +138,11 @@ class MultiFolderDialog(QDialog):
                 seen.add(p)
                 out.append(p)
         return out
+
+    def selected_folders(self):
+        """Return selected folder paths, deduplicated in selection order."""
+        return [
+            p
+            for p in self.selected_paths()
+            if os.path.isdir(p)
+        ]

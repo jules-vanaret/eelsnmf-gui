@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Dict, List, Tuple
 
-import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib as mpl
-import EELSNMF.utils as enmfu  # type: ignore[import-not-found]
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def add_scale_bar(
@@ -105,13 +105,66 @@ def _validate_image_inputs(
     return n
 
 
+def _row_inputs(
+    L: Sequence[Sequence[np.ndarray]],
+    L_original: Sequence[Sequence[np.ndarray]],
+    L_mask: Sequence[Sequence[np.ndarray]] | None,
+    L_components: Sequence[Sequence[Sequence[np.ndarray]]] | None,
+    i: int,
+):
+    """Gather the image lists of row *i* into plotting-ready form."""
+    row_imgs_original = list(L_original[i])
+    row_imgs_processed = list(L[i])
+    row_imgs_mask = list(L_mask[i]) if L_mask is not None else None
+    component_rows = []
+    if L_components is not None:
+        for comp in L_components:
+            component_rows.append(
+                list(comp[i]) if comp[i] is not None else []
+            )
+    return row_imgs_original, row_imgs_mask, row_imgs_processed, component_rows
+
+
+def _image_columns(
+    row_imgs_original,
+    row_imgs_mask,
+    row_imgs_processed,
+    component_rows,
+    *,
+    image_cmap: str | None,
+    image_vmin: float | None,
+    image_vmax: float | None,
+):
+    """Build the display column descriptors shared by all grid plots."""
+    image_columns = [{"imgs": row_imgs_original, "cmap": "gray"}]
+    if row_imgs_mask is not None:
+        image_columns.append({"imgs": row_imgs_mask, "cmap": "gray"})
+    image_columns.append(
+        {
+            "imgs": row_imgs_processed,
+            "cmap": image_cmap,
+            "vmin": image_vmin,
+            "vmax": image_vmax,
+        }
+    )
+    for row_imgs in component_rows:
+        image_columns.append({"imgs": row_imgs, "cmap": None})
+    return image_columns
+
+
+def _pixel_scale_for(list_pixel_scales, i: int) -> float | None:
+    if list_pixel_scales is not None and i < len(list_pixel_scales):
+        return list_pixel_scales[i]
+    return None
+
+
 def _plot_image_row(
     fig,
     gs,
     row_index: int,
     label: str,
     image_columns,
-    pixel_scale: Optional[float],
+    pixel_scale: float | None,
     *,
     image_interpolation: str,
     image_aspect: str,
@@ -190,13 +243,13 @@ def _format_summary_value(column: str, value) -> str:
 
 
 def _has_summary_rows(
-    summary_rows: Optional[Sequence[Dict[str, float]]],
+    summary_rows: Sequence[Dict[str, float]] | None,
 ) -> bool:
     return bool(summary_rows)
 
 
 def _has_summary_tables(
-    summary_tables: Optional[Sequence[Sequence[Dict[str, float]]]],
+    summary_tables: Sequence[Sequence[Dict[str, float]]] | None,
 ) -> bool:
     if not summary_tables:
         return False
@@ -227,7 +280,7 @@ def _add_summary_table(
     table.set_fontsize(6)
     table.scale(1.0, 1.45)
     table.auto_set_column_width(list(range(len(columns))))
-    for (row, col), cell in table.get_celld().items():
+    for (row, _col), cell in table.get_celld().items():
         if show_header and row == 0:
             cell.get_text().set_wrap(True)
             cell.set_height(cell.get_height() * 1.4)
@@ -241,7 +294,7 @@ def _plot_shifted_edges(
     colors: Sequence[np.ndarray],
     *,
     text_pad_points: float,
-    split_indices: Optional[np.ndarray] = None,
+    split_indices: np.ndarray | None = None,
 ):
     axes_list = list(axes) if isinstance(axes, (list, tuple)) else [axes]
     reference_chunks = None
@@ -337,32 +390,32 @@ def _find_gap_splits(x_axis: np.ndarray, *, gap_factor: float = 5.0):
 def plot_image_grid_and_shifted_pairs(
     L: Sequence[Sequence[np.ndarray]],
     L_original: Sequence[Sequence[np.ndarray]],
-    L_mask: Optional[Sequence[Sequence[np.ndarray]]],
+    L_mask: Sequence[Sequence[np.ndarray]] | None,
     E: Sequence[Sequence[np.ndarray]],
     S: Sequence[str],
     list_x_axis: Sequence[np.ndarray],
     title: str,
     E_combined: Sequence[np.ndarray],
     x_axis_combined: np.ndarray,
-    list_pixel_scales: Sequence[float] = None,
+    list_pixel_scales: Sequence[float] | None = None,
     colors: Sequence[np.ndarray] = (
         np.array([1, 0, 0]),
         np.array([0, 1, 0]),
     ),
     *,
-    L_components: Optional[Sequence[Sequence[Sequence[np.ndarray]]]] = None,
-    figsize: Optional[Tuple[float, float]] = None,
+    L_components: Sequence[Sequence[Sequence[np.ndarray]]] | None = None,
+    figsize: Tuple[float, float] | None = None,
     left_width_ratios: Tuple[float, float] = (0.7, 0.7),
-    image_cmap: Optional[str] = None,
-    image_vmin: Optional[float] = None,
-    image_vmax: Optional[float] = None,
+    image_cmap: str | None = None,
+    image_vmin: float | None = None,
+    image_vmax: float | None = None,
     image_interpolation: str = "nearest",
     image_aspect: str = "equal",
     label_pad: float = 8.0,
     text_pad_points: float = 2.0,
-    suptitle: Optional[str] = None,
-    summary_tables: Optional[Sequence[Sequence[Dict[str, float]]]] = None,
-    summary_joint: Optional[Sequence[Dict[str, float]]] = None,
+    suptitle: str | None = None,
+    summary_tables: Sequence[Sequence[Dict[str, float]]] | None = None,
+    summary_joint: Sequence[Dict[str, float]] | None = None,
 ):
     n, n_components = _validate_plot_inputs(L, E, S)
     if L_mask is not None and len(L_mask) != n:
@@ -477,42 +530,28 @@ def plot_image_grid_and_shifted_pairs(
         )
 
     for i in range(n):
-        row_imgs_original = list(L_original[i])
-        row_imgs_processed = list(L[i])
-        row_imgs_mask = list(L_mask[i]) if L_mask is not None else []
-        component_rows = []
-        if L_components is not None:
-            for comp in L_components:
-                component_rows.append(
-                    list(comp[i]) if comp[i] is not None else []
-                )
-        pixel_scale = (
-            list_pixel_scales[i]
-            if list_pixel_scales is not None and i < len(list_pixel_scales)
-            else None
+        (
+            row_imgs_original,
+            row_imgs_mask,
+            row_imgs_processed,
+            component_rows,
+        ) = _row_inputs(L, L_original, L_mask, L_components, i)
+        image_columns = _image_columns(
+            row_imgs_original,
+            row_imgs_mask,
+            row_imgs_processed,
+            component_rows,
+            image_cmap=image_cmap,
+            image_vmin=image_vmin,
+            image_vmax=image_vmax,
         )
-        image_columns = [
-            {"imgs": row_imgs_original, "cmap": "gray"},
-        ]
-        if L_mask is not None:
-            image_columns.append({"imgs": row_imgs_mask, "cmap": "gray"})
-        image_columns.append(
-            {
-                "imgs": row_imgs_processed,
-                "cmap": image_cmap,
-                "vmin": image_vmin,
-                "vmax": image_vmax,
-            }
-        )
-        for row_imgs in component_rows:
-            image_columns.append({"imgs": row_imgs, "cmap": None})
         _plot_image_row(
             fig,
             gs_left,
             n - 1 - i,
             S[i],
             image_columns,
-            pixel_scale,
+            _pixel_scale_for(list_pixel_scales, i),
             image_interpolation=image_interpolation,
             image_aspect=image_aspect,
             label_pad=label_pad,
@@ -556,28 +595,28 @@ def plot_image_grid_and_shifted_pairs(
 def plot_image_grid_with_edges(
     L: Sequence[Sequence[np.ndarray]],
     L_original: Sequence[Sequence[np.ndarray]],
-    L_mask: Optional[Sequence[Sequence[np.ndarray]]],
+    L_mask: Sequence[Sequence[np.ndarray]] | None,
     E: Sequence[Sequence[np.ndarray]],
     S: Sequence[str],
     list_x_axis: Sequence[np.ndarray],
     title: str,
-    list_pixel_scales: Sequence[float] = None,
+    list_pixel_scales: Sequence[float] | None = None,
     colors: Sequence[np.ndarray] = (
         np.array([1, 0, 0]),
         np.array([0, 1, 0]),
     ),
     *,
-    L_components: Optional[Sequence[Sequence[Sequence[np.ndarray]]]] = None,
-    figsize: Optional[Tuple[float, float]] = None,
-    image_cmap: Optional[str] = None,
-    image_vmin: Optional[float] = None,
-    image_vmax: Optional[float] = None,
+    L_components: Sequence[Sequence[Sequence[np.ndarray]]] | None = None,
+    figsize: Tuple[float, float] | None = None,
+    image_cmap: str | None = None,
+    image_vmin: float | None = None,
+    image_vmax: float | None = None,
     image_interpolation: str = "nearest",
     image_aspect: str = "equal",
     label_pad: float = 8.0,
     text_pad_points: float = 2.0,
-    suptitle: Optional[str] = None,
-    summary_tables: Optional[Sequence[Sequence[Dict[str, float]]]] = None,
+    suptitle: str | None = None,
+    summary_tables: Sequence[Sequence[Dict[str, float]]] | None = None,
 ):
     n, n_components = _validate_plot_inputs(L, E, S)
     if L_mask is not None and len(L_mask) != n:
@@ -622,42 +661,28 @@ def plot_image_grid_with_edges(
     ]
 
     for i in range(n):
-        row_imgs_original = list(L_original[i])
-        row_imgs_processed = list(L[i])
-        row_imgs_mask = list(L_mask[i]) if L_mask is not None else []
-        component_rows = []
-        if L_components is not None:
-            for comp in L_components:
-                component_rows.append(
-                    list(comp[i]) if comp[i] is not None else []
-                )
-        pixel_scale = (
-            list_pixel_scales[i]
-            if list_pixel_scales is not None and i < len(list_pixel_scales)
-            else None
+        (
+            row_imgs_original,
+            row_imgs_mask,
+            row_imgs_processed,
+            component_rows,
+        ) = _row_inputs(L, L_original, L_mask, L_components, i)
+        image_columns = _image_columns(
+            row_imgs_original,
+            row_imgs_mask,
+            row_imgs_processed,
+            component_rows,
+            image_cmap=image_cmap,
+            image_vmin=image_vmin,
+            image_vmax=image_vmax,
         )
-        image_columns = [
-            {"imgs": row_imgs_original, "cmap": "gray"},
-        ]
-        if L_mask is not None:
-            image_columns.append({"imgs": row_imgs_mask, "cmap": "gray"})
-        image_columns.append(
-            {
-                "imgs": row_imgs_processed,
-                "cmap": image_cmap,
-                "vmin": image_vmin,
-                "vmax": image_vmax,
-            }
-        )
-        for row_imgs in component_rows:
-            image_columns.append({"imgs": row_imgs, "cmap": None})
         _plot_image_row(
             fig,
             gs,
             n - 1 - i,
             S[i],
             image_columns,
-            pixel_scale,
+            _pixel_scale_for(list_pixel_scales, i),
             image_interpolation=image_interpolation,
             image_aspect=image_aspect,
             label_pad=label_pad,
@@ -703,26 +728,26 @@ def plot_image_grid_with_edges(
 def plot_joint_summary_with_images(
     L: Sequence[Sequence[np.ndarray]],
     L_original: Sequence[Sequence[np.ndarray]],
-    L_mask: Optional[Sequence[Sequence[np.ndarray]]],
+    L_mask: Sequence[Sequence[np.ndarray]] | None,
     S: Sequence[str],
     edges_combined: Sequence[np.ndarray],
     x_axis_combined: np.ndarray,
-    list_pixel_scales: Sequence[float] = None,
+    list_pixel_scales: Sequence[float] | None = None,
     colors: Sequence[np.ndarray] = (
         np.array([1, 0, 0]),
         np.array([0, 1, 0]),
     ),
     *,
-    L_components: Optional[Sequence[Sequence[Sequence[np.ndarray]]]] = None,
-    figsize: Optional[Tuple[float, float]] = None,
-    image_cmap: Optional[str] = None,
-    image_vmin: Optional[float] = None,
-    image_vmax: Optional[float] = None,
+    L_components: Sequence[Sequence[Sequence[np.ndarray]]] | None = None,
+    figsize: Tuple[float, float] | None = None,
+    image_cmap: str | None = None,
+    image_vmin: float | None = None,
+    image_vmax: float | None = None,
     image_interpolation: str = "nearest",
     image_aspect: str = "equal",
     label_pad: float = 8.0,
-    suptitle: Optional[str] = None,
-    summary_table: Optional[Sequence[Dict[str, float]]] = None,
+    suptitle: str | None = None,
+    summary_table: Sequence[Dict[str, float]] | None = None,
 ):
     n = _validate_image_inputs(L, S)
     if L_mask is not None and len(L_mask) != n:
@@ -775,42 +800,28 @@ def plot_joint_summary_with_images(
     )
 
     for i in range(n):
-        row_imgs_original = list(L_original[i])
-        row_imgs_processed = list(L[i])
-        row_imgs_mask = list(L_mask[i]) if L_mask is not None else []
-        component_rows = []
-        if L_components is not None:
-            for comp in L_components:
-                component_rows.append(
-                    list(comp[i]) if comp[i] is not None else []
-                )
-        pixel_scale = (
-            list_pixel_scales[i]
-            if list_pixel_scales is not None and i < len(list_pixel_scales)
-            else None
+        (
+            row_imgs_original,
+            row_imgs_mask,
+            row_imgs_processed,
+            component_rows,
+        ) = _row_inputs(L, L_original, L_mask, L_components, i)
+        image_columns = _image_columns(
+            row_imgs_original,
+            row_imgs_mask,
+            row_imgs_processed,
+            component_rows,
+            image_cmap=image_cmap,
+            image_vmin=image_vmin,
+            image_vmax=image_vmax,
         )
-        image_columns = [
-            {"imgs": row_imgs_original, "cmap": "gray"},
-        ]
-        if L_mask is not None:
-            image_columns.append({"imgs": row_imgs_mask, "cmap": "gray"})
-        image_columns.append(
-            {
-                "imgs": row_imgs_processed,
-                "cmap": image_cmap,
-                "vmin": image_vmin,
-                "vmax": image_vmax,
-            }
-        )
-        for row_imgs in component_rows:
-            image_columns.append({"imgs": row_imgs, "cmap": None})
         _plot_image_row(
             fig,
             gs,
             n - 1 - i,
             S[i],
             image_columns,
-            pixel_scale,
+            _pixel_scale_for(list_pixel_scales, i),
             image_interpolation=image_interpolation,
             image_aspect=image_aspect,
             label_pad=label_pad,
@@ -864,9 +875,9 @@ def plot_joint_edges(
         np.array([0, 1, 0]),
     ),
     *,
-    figsize: Optional[Tuple[float, float]] = None,
-    suptitle: Optional[str] = None,
-    summary_table: Optional[Sequence[Dict[str, float]]] = None,
+    figsize: Tuple[float, float] | None = None,
+    suptitle: str | None = None,
+    summary_table: Sequence[Dict[str, float]] | None = None,
 ):
     if figsize is None:
         figsize = (8, 4)
@@ -929,6 +940,8 @@ def plot_joint_edges(
 
 
 def plot_energy_ranges(list_decos, fine_structure_ranges):
+    import EELSNMF.utils as enmfu  # lazy heavy import
+
     plt.figure("Edges energy ranges")
     plt.clf()
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]

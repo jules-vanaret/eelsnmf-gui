@@ -2,64 +2,73 @@
 This module contains Qt widgets for EELS spectroscopy processing and analysis.
 """
 
-from typing import Dict, List, Optional
 import logging
 import os
 import pickle
 import sys
-import numpy as np
-import matplotlib.pyplot as plt
+from functools import partial
 
+import matplotlib.pyplot as plt
+import numpy as np
+from qtpy.QtCore import QObject, QPoint, QSettings, Qt, QThread, Signal
+from qtpy.QtGui import QColor, QTextCursor, QToolTip
 from qtpy.QtWidgets import (
-    QHBoxLayout,
-    QPushButton,
-    QWidget,
-    QVBoxLayout,
-    QGroupBox,
-    QLabel,
+    QAbstractItemView,
+    QApplication,
     QCheckBox,
-    QSpinBox,
+    QColorDialog,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QAbstractItemView,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
+    QLabel,
     QListView,
-    QTreeView,
-    QColorDialog,
-    QProgressBar,
-    QApplication,
+    QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QHeaderView,
-    QMessageBox,
-    QInputDialog,
+    QToolButton,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
 )
-from qtpy.QtCore import Qt, QThread, Signal, QObject, QSettings
-from qtpy.QtGui import QColor, QTextCursor
 
-from ._processing import (
-    process_folders,
-    build_deco_for_folders_to_plot_er,
-    build_scree_plot_inputs,
-    build_mask_preview_for_folders,
+from ._analysis import (  # noqa: F401  (re-exported for tests)
+    apply_colors,
+    component_maps,
+    component_maps_from_deco,
+    edge_totals,
+    extract_edge_collection,
+    order_by_power,
+    summary_rows,
 )
 from ._export import (
-    export_edges_by_label_to_csv,
     export_edge_contributions_summary_to_csv,
-    save_component_images,
+    export_edges_by_label_to_csv,
     save_colored_images,
+    save_component_images,
     save_mask_images,
     save_original_images,
     save_summary_plot,
 )
-from ._labels import (
-    split_common_label_parts,
-)
 from ._file_dialog import (
     MultiFolderDialog,
 )
+from ._labels import (
+    split_common_label_parts,
+)
+from ._nmf import cupy_gpu_available
 from ._plotting import plot_energy_ranges
+from ._preprocess import load_eml_folders
+from .session import BeamParams, MaskParams, Session
 
 # Default edge energy ranges (in eV)
 DEFAULT_EDGE_RANGES = {
@@ -67,17 +76,34 @@ DEFAULT_EDGE_RANGES = {
     "O_K": (522.0, 590.0),
 }
 
+# Decomposition methods exposed by the EELSNMF package.
+DECOMPOSITION_METHODS = (
+    "default_decomposition",
+    "default_kl_decomposition",
+    "alternate_decomposition",
+    "SumRule_decomposition",
+    "EdgeTV_decomposition",
+    "combinedTVSR_decomposition",
+)
+# Methods accepting a regularization lambda.
+REGULARIZED_METHODS = {
+    "SumRule_decomposition",
+    "EdgeTV_decomposition",
+    "combinedTVSR_decomposition",
+}
+
 
 class _ProcessingWorker(QObject):
     finished = Signal(object, object)
 
-    def __init__(self, params: dict):
+    def __init__(self, session: Session, run_kwargs: dict):
         super().__init__()
-        self._params = params
+        self._session = session
+        self._run_kwargs = run_kwargs
 
     def run(self):
         try:
-            results = process_folders(**self._params)
+            results = self._session.run(**self._run_kwargs)
             self.finished.emit(results, None)
         except Exception as exc:  # pragma: no cover - UI error path
             self.finished.emit(None, exc)
@@ -91,6 +117,19 @@ class NoWheelSpinBox(QSpinBox):
 class NoWheelDoubleSpinBox(QDoubleSpinBox):
     def wheelEvent(self, event):
         event.ignore()
+
+
+class HelpButton(QToolButton):
+    """'?' button that shows its tooltip immediately on hover."""
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        pos = self.mapToGlobal(QPoint(0, self.height()))
+        QToolTip.showText(pos, self.toolTip(), self)
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
+        super().leaveEvent(event)
 
 
 class _QtLogHandler(logging.Handler, QObject):
@@ -166,9 +205,22 @@ class _StdoutStderrRedirect:
 class EELSProcessingWidget(QWidget):
     """Widget for EELS NMF processing with configurable parameters."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(
+        self,
+        debug: bool = False,
+        pre_mode: bool = True,
+        joint_mode: bool = True,
+    ):
         super().__init__()
         self.debug = debug
+        # In pre_mode the GUI shows the preprocessing controls and the loader
+        # runs ZLP alignment + despiking. Otherwise the loaded SIs are
+        # assumed already preprocessed and the section is hidden.
+        self.pre_mode = pre_mode
+        # In joint_mode the GUI offers joint processing of several folders.
+        # Otherwise the "Process folders" controls are hidden and individual
+        # processing is forced.
+        self.joint_mode = joint_mode
 
         # Initialize parameter values
         self.e0 = 300.0  # keV
@@ -178,6 +230,11 @@ class EELSProcessingWidget(QWidget):
         self.median_filter_size = 11
         self._saved_ranges = None
         self.n_components = 2
+        self.tol = 1e-8
+        self.error_skip_step = 100
+        self.decomposition_method = "default_decomposition"
+        self.regularization = 0.1
+        self.n_power_laws = 50
         self.mask_enabled = False
         self.mask_dilation_iters = 1
         self.colors = [
@@ -190,12 +247,17 @@ class EELSProcessingWidget(QWidget):
         self.source_folders = []
         self.results_folder = None
         self.save_results = False
+        self.save_deco = True  # deco objects are the default saved output
+        self.save_pickle = False
         self.save_colored_images = False
+        self.save_masks = False
         self.save_original_images = False
         self.save_summary_plot = False
         self.show_summary_plot = True
         self.save_excel = False
         self.process_individual = True
+        self.despike_method = "eml"
+        self._loaded_deco = None
         self.process_joint = False
         self._worker_thread = None
         self._worker = None
@@ -203,7 +265,9 @@ class EELSProcessingWidget(QWidget):
         self._log_handler = None
         self._original_stdout = None
         self._original_stderr = None
-        self._preprocess_cache: Dict[tuple, object] = {}
+        self._session: Session | None = None
+        self._last_results = None
+        self._log_splitter_sizes = None
         self._app = QApplication.instance()
         if self._app is not None:
             self._app.aboutToQuit.connect(
@@ -211,6 +275,11 @@ class EELSProcessingWidget(QWidget):
             )
 
         self._load_settings()
+
+        if not self.joint_mode:
+            # Joint processing is not accessible: force individual-only.
+            self.process_joint = False
+            self.process_individual = True
 
         # Build UI
         self._build_ui()
@@ -220,6 +289,8 @@ class EELSProcessingWidget(QWidget):
         """Construct the widget layout."""
         left_column_layout = QVBoxLayout()
         middle_column_layout = QVBoxLayout()
+        # No bottom margin so the log toggle can sit flush with the window rim.
+        middle_column_layout.setContentsMargins(9, 9, 9, 0)
 
         # Data Input Section
         input_group = QGroupBox("Data Input")
@@ -241,7 +312,7 @@ class EELSProcessingWidget(QWidget):
         preprocessing_layout = QVBoxLayout()
 
         median_filter_layout = QHBoxLayout()
-        median_filter_layout.addWidget(QLabel("Median filter size:"))
+        median_filter_layout.addWidget(QLabel("Median filter size (Hampel):"))
         self.median_filter_spinbox = NoWheelSpinBox()
         self.median_filter_spinbox.setRange(1, 101)
         self.median_filter_spinbox.setValue(self.median_filter_size)
@@ -250,13 +321,50 @@ class EELSProcessingWidget(QWidget):
             self._on_median_filter_size_changed
         )
         median_filter_layout.addWidget(self.median_filter_spinbox)
+        median_filter_layout.addWidget(
+            self._make_help_button(
+                "Size of the Hampel median filter along the energy axis.\n"
+                "Only used when Hampel despiking is enabled."
+            )
+        )
         preprocessing_layout.addLayout(median_filter_layout)
+
+        despike_layout = QHBoxLayout()
+        despike_layout.addWidget(QLabel("Despiking:"))
+        self.despike_combo = QComboBox()
+        self.despike_combo.addItem("EML despike (default)", "eml")
+        self.despike_combo.addItem("Hampel filter (median-based)", "hampel")
+        index = self.despike_combo.findData(self.despike_method)
+        self.despike_combo.setCurrentIndex(max(index, 0))
+        self.despike_combo.currentIndexChanged.connect(
+            self._on_despike_changed
+        )
+        despike_layout.addWidget(self.despike_combo)
+        despike_layout.addWidget(
+            self._make_help_button(
+                "Despiking algorithm applied after ZLP alignment:\n"
+                "- EML despike (default): the EELSNMF despike algorithm,\n"
+                "  run 10 times on each image\n"
+                "- Hampel filter: a median-based filter on each spectrum,\n"
+                "  using the median filter size above."
+            )
+        )
+        despike_layout.addStretch()
+        preprocessing_layout.addLayout(despike_layout)
+        self._update_median_availability()
 
         mask_layout = QHBoxLayout()
         self.mask_checkbox = QCheckBox("Mask dark pixels")
         self.mask_checkbox.setChecked(self.mask_enabled)
         self.mask_checkbox.stateChanged.connect(self._on_mask_enabled_changed)
         mask_layout.addWidget(self.mask_checkbox)
+        mask_layout.addWidget(
+            self._make_help_button(
+                "Exclude dark pixels (vacuum / substrate) from the "
+                "decomposition.\nA threshold mask is computed from the "
+                "energy-aggregated image."
+            )
+        )
 
         mask_layout.addStretch()
         mask_layout.addWidget(QLabel("Dilation iters"))
@@ -277,6 +385,11 @@ class EELSProcessingWidget(QWidget):
 
         preprocessing_group.setLayout(preprocessing_layout)
         left_column_layout.addWidget(preprocessing_group)
+        self.preprocessing_group = preprocessing_group
+        if not self.pre_mode:
+            # SIs are assumed already preprocessed: hide the whole section
+            # (median filter size and mask controls are not applicable).
+            preprocessing_group.setVisible(False)
 
         # Microscope Parameters Section
         microscope_group = QGroupBox("Microscope Parameters")
@@ -291,6 +404,11 @@ class EELSProcessingWidget(QWidget):
         self.e0_spinbox.setSingleStep(10.0)
         self.e0_spinbox.valueChanged.connect(self._on_e0_changed)
         e0_layout.addWidget(self.e0_spinbox)
+        e0_layout.addWidget(
+            self._make_help_button(
+                "Acceleration voltage of the microscope, in keV."
+            )
+        )
         microscope_layout.addLayout(e0_layout)
 
         # Convergence and collection angles in one line
@@ -304,6 +422,11 @@ class EELSProcessingWidget(QWidget):
         self.alpha_spinbox.setSingleStep(0.1)
         self.alpha_spinbox.valueChanged.connect(self._on_alpha_changed)
         angles_layout.addWidget(self.alpha_spinbox)
+        angles_layout.addWidget(
+            self._make_help_button(
+                "Convergence semi-angle of the beam, in mrad."
+            )
+        )
 
         angles_layout.addWidget(QLabel("β"))
         self.beta_spinbox = NoWheelDoubleSpinBox()
@@ -312,6 +435,11 @@ class EELSProcessingWidget(QWidget):
         self.beta_spinbox.setSingleStep(0.1)
         self.beta_spinbox.valueChanged.connect(self._on_beta_changed)
         angles_layout.addWidget(self.beta_spinbox)
+        angles_layout.addWidget(
+            self._make_help_button(
+                "Collection semi-angle of the detector, in mrad."
+            )
+        )
         microscope_layout.addLayout(angles_layout)
 
         microscope_group.setLayout(microscope_layout)
@@ -343,8 +471,35 @@ class EELSProcessingWidget(QWidget):
         self.remove_range_button = QPushButton("Remove selected")
         self.remove_range_button.clicked.connect(self._remove_selected_range)
         ranges_buttons_layout.addWidget(self.remove_range_button)
+        ranges_buttons_layout.addWidget(
+            self._make_help_button(
+                "Fine-structure (ELNES) energy windows, in eV.\n"
+                "Each enabled entry defines one edge to fit: its name "
+                "and its (min, max) energy window."
+            )
+        )
         ranges_buttons_layout.addStretch()
         structure_layout.addLayout(ranges_buttons_layout)
+
+        # Number of power-law backgrounds in the spectral model (G)
+        power_laws_layout = QHBoxLayout()
+        power_laws_layout.addWidget(QLabel("Number of power laws:"))
+        self.power_laws_spinbox = NoWheelSpinBox()
+        self.power_laws_spinbox.setRange(1, 500)
+        self.power_laws_spinbox.setValue(self.n_power_laws)
+        self.power_laws_spinbox.setSingleStep(5)
+        self.power_laws_spinbox.valueChanged.connect(
+            self._on_n_power_laws_changed
+        )
+        power_laws_layout.addWidget(self.power_laws_spinbox)
+        power_laws_layout.addWidget(
+            self._make_help_button(
+                "Number of power-law backgrounds used to fit the "
+                "background signal (exponents spanning 0.5-8)."
+            )
+        )
+        power_laws_layout.addStretch()
+        structure_layout.addLayout(power_laws_layout)
 
         structure_group.setLayout(structure_layout)
         left_column_layout.addWidget(structure_group)
@@ -360,6 +515,39 @@ class EELSProcessingWidget(QWidget):
             self._plot_explained_variance_ratio
         )
         sanity_layout.addWidget(self.variance_button)
+
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.addItem("None (run processing first)", None)
+        model_layout.addWidget(self.model_combo, stretch=1)
+        sanity_layout.addLayout(model_layout)
+
+        model_buttons = QGridLayout()
+        self.plot_factors_button = QPushButton("Factors")
+        self.plot_factors_button.clicked.connect(
+            lambda: self._plot_from_model("plot_factors")
+        )
+        self.plot_edges_button = QPushButton("Edges")
+        self.plot_edges_button.clicked.connect(
+            lambda: self._plot_from_model("plot_edges")
+        )
+        self.plot_average_model_button = QPushButton("Average model")
+        self.plot_average_model_button.clicked.connect(
+            lambda: self._plot_from_model("plot_average_model")
+        )
+        self.plot_model_energy_ranges_button = QPushButton(
+            "Model energy ranges"
+        )
+        self.plot_model_energy_ranges_button.clicked.connect(
+            lambda: self._plot_from_model("plot_energy_ranges")
+        )
+        model_buttons.addWidget(self.plot_factors_button, 0, 0)
+        model_buttons.addWidget(self.plot_edges_button, 0, 1)
+        model_buttons.addWidget(self.plot_average_model_button, 1, 0)
+        model_buttons.addWidget(self.plot_model_energy_ranges_button, 1, 1)
+        sanity_layout.addLayout(model_buttons)
+
         sanity_group.setLayout(sanity_layout)
         left_column_layout.addWidget(sanity_group)
 
@@ -376,7 +564,98 @@ class EELSProcessingWidget(QWidget):
         self.iter_spinbox.setSingleStep(100)
         self.iter_spinbox.valueChanged.connect(self._on_max_iters_changed)
         iter_layout.addWidget(self.iter_spinbox)
+        iter_layout.addWidget(
+            self._make_help_button(
+                "Maximum number of NMF iterations.\n"
+                "The decomposition stops earlier if the convergence "
+                "tolerance is reached."
+            )
+        )
         processing_layout.addLayout(iter_layout)
+
+        # Convergence tolerance
+        tol_layout = QHBoxLayout()
+        tol_layout.addWidget(QLabel("Convergence tolerance:"))
+        self.tol_spinbox = NoWheelDoubleSpinBox()
+        self.tol_spinbox.setRange(1e-12, 1.0)
+        self.tol_spinbox.setDecimals(12)
+        self.tol_spinbox.setSingleStep(1e-8)
+        self.tol_spinbox.setValue(self.tol)
+        self.tol_spinbox.valueChanged.connect(self._on_tol_changed)
+        tol_layout.addWidget(self.tol_spinbox)
+        tol_layout.addWidget(
+            self._make_help_button(
+                "Convergence tolerance of the NMF: the decomposition "
+                "stops when the relative change of the total error "
+                "between two error evaluations falls below this "
+                "value."
+            )
+        )
+        processing_layout.addLayout(tol_layout)
+
+        # Error skip step
+        skip_layout = QHBoxLayout()
+        skip_layout.addWidget(QLabel("Error skip step:"))
+        self.error_skip_spinbox = NoWheelSpinBox()
+        self.error_skip_spinbox.setRange(1, 100000)
+        self.error_skip_spinbox.setValue(self.error_skip_step)
+        self.error_skip_spinbox.setSingleStep(10)
+        self.error_skip_spinbox.valueChanged.connect(
+            self._on_error_skip_step_changed
+        )
+        skip_layout.addWidget(self.error_skip_spinbox)
+        skip_layout.addWidget(
+            self._make_help_button(
+                "How often (in iterations) the full reconstruction "
+                "error is evaluated for the convergence test.\n"
+                "Increase for speed on large datasets."
+            )
+        )
+        processing_layout.addLayout(skip_layout)
+
+        # Decomposition method and regularization lambda
+        method_layout = QHBoxLayout()
+        method_layout.addWidget(QLabel("Method:"))
+        self.method_combo = QComboBox()
+        for method_name in DECOMPOSITION_METHODS:
+            self.method_combo.addItem(method_name)
+        self.method_combo.setCurrentText(self.decomposition_method)
+        self.method_combo.currentTextChanged.connect(
+            self._on_decomposition_method_changed
+        )
+        method_layout.addWidget(self.method_combo, stretch=1)
+        method_layout.addWidget(
+            self._make_help_button(
+                "Algorithm used for the decomposition.\n"
+                "default: standard NMF; default_kl: KL divergence; "
+                "alternate: alternating background/ELNES updates; "
+                "SumRule / EdgeTV / combinedTVSR: regularized variants "
+                "(these use the lambda parameter)."
+            )
+        )
+        processing_layout.addLayout(method_layout)
+
+        reg_layout = QHBoxLayout()
+        reg_layout.addWidget(QLabel("Regularization \u03bb:"))
+        self.regularization_spinbox = NoWheelDoubleSpinBox()
+        self.regularization_spinbox.setRange(0.0, 1000.0)
+        self.regularization_spinbox.setDecimals(4)
+        self.regularization_spinbox.setSingleStep(0.01)
+        self.regularization_spinbox.setValue(self.regularization)
+        self.regularization_spinbox.valueChanged.connect(
+            self._on_regularization_changed
+        )
+        reg_layout.addWidget(self.regularization_spinbox)
+        reg_layout.addWidget(
+            self._make_help_button(
+                "Regularization lambda of the selected method "
+                "(SumRule, EdgeTV or combinedTVSR only).\n"
+                "Larger values enforce the constraint more strongly."
+            )
+        )
+        reg_layout.addStretch()
+        processing_layout.addLayout(reg_layout)
+        self._update_regularization_availability()
 
         components_layout = QHBoxLayout()
         components_layout.addWidget(QLabel("Number of components:"))
@@ -387,6 +666,11 @@ class EELSProcessingWidget(QWidget):
             self._on_n_components_changed
         )
         components_layout.addWidget(self.components_spinbox)
+        components_layout.addWidget(
+            self._make_help_button(
+                "Number of NMF components to decompose the data into."
+            )
+        )
         processing_layout.addLayout(components_layout)
 
         mode_layout = QHBoxLayout()
@@ -412,7 +696,13 @@ class EELSProcessingWidget(QWidget):
         self.process_joint_checkbox.stateChanged.connect(
             self._on_processing_mode_changed
         )
-        processing_layout.addLayout(mode_layout)
+        # Wrapped in a widget row so the whole mode selector can be hidden.
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.processing_mode_row = QWidget()
+        self.processing_mode_row.setLayout(mode_layout)
+        processing_layout.addWidget(self.processing_mode_row)
+        if not self.joint_mode:
+            self.processing_mode_row.setVisible(False)
         self._on_processing_mode_changed(None)
         self._update_processing_mode_availability()
 
@@ -428,19 +718,89 @@ class EELSProcessingWidget(QWidget):
 
         processing_layout.addLayout(color_layout)
 
+        # Backend selection (CUDA when available)
+        cuda_layout = QHBoxLayout()
+        cuda_layout.addWidget(QLabel("Backend:"))
+        self.use_cupy_checkbox = QCheckBox("Use CUDA (GPU)")
+        cuda_available = cupy_gpu_available()
+        self.use_cupy_checkbox.setChecked(cuda_available)
+        self.use_cupy_checkbox.setEnabled(cuda_available)
+        if cuda_available:
+            self.use_cupy_checkbox.setToolTip(
+                "Run the decomposition on the GPU (faster when available)."
+            )
+        else:
+            self.use_cupy_checkbox.setToolTip(
+                "CuPy or a CUDA device is not available"
+            )
+        cuda_layout.addWidget(self.use_cupy_checkbox)
+        cuda_layout.addStretch()
+        processing_layout.addLayout(cuda_layout)
+
         processing_group.setLayout(processing_layout)
         middle_column_layout.addWidget(processing_group)
 
         # Save Options Section
-        save_group = QGroupBox("Save Results")
+        save_group = QGroupBox("Saving parameters")
         save_layout = QVBoxLayout()
 
         self.save_results_checkbox = QCheckBox("Save results")
         self.save_results_checkbox.setChecked(self.save_results)
         self.save_results_checkbox.stateChanged.connect(
-            self._on_save_results_changed
+            self._sync_save_flags
         )
         save_layout.addWidget(self.save_results_checkbox)
+
+        self.save_deco_checkbox = QCheckBox("Deco objects (EELSNMF)")
+        self.save_deco_checkbox.setToolTip(
+            "Save each EELSNMF deco object (its own .pkl format,\n"
+            "plus the preprocessed signal as .hspy). Default output."
+        )
+        self.save_deco_checkbox.setChecked(self.save_deco)
+        self.save_deco_checkbox.stateChanged.connect(self._sync_save_flags)
+        save_layout.addWidget(self.save_deco_checkbox)
+
+        self.save_pickle_checkbox = QCheckBox("Full results pickle")
+        self.save_pickle_checkbox.setToolTip(
+            "Pickle the full processing results (images, edges,\n"
+            "summaries and decos). Required to re-export every output\n"
+            "exactly later, especially for joint or masked runs."
+        )
+        self.save_pickle_checkbox.setChecked(self.save_pickle)
+        self.save_pickle_checkbox.stateChanged.connect(self._sync_save_flags)
+        save_layout.addWidget(self.save_pickle_checkbox)
+
+        self.save_colored_checkbox = QCheckBox("Colored component images")
+        self.save_colored_checkbox.setChecked(self.save_colored_images)
+        self.save_colored_checkbox.stateChanged.connect(self._sync_save_flags)
+        save_layout.addWidget(self.save_colored_checkbox)
+
+        self.save_masks_checkbox = QCheckBox("Mask images")
+        self.save_masks_checkbox.setChecked(self.save_masks)
+        self.save_masks_checkbox.stateChanged.connect(self._sync_save_flags)
+        save_layout.addWidget(self.save_masks_checkbox)
+
+        self.save_original_checkbox = QCheckBox("Original images")
+        self.save_original_checkbox.setChecked(self.save_original_images)
+        self.save_original_checkbox.stateChanged.connect(
+            self._sync_save_flags
+        )
+        save_layout.addWidget(self.save_original_checkbox)
+
+        self.save_summary_checkbox = QCheckBox("Summary plot")
+        self.save_summary_checkbox.setChecked(self.save_summary_plot)
+        self.save_summary_checkbox.stateChanged.connect(self._sync_save_flags)
+        save_layout.addWidget(self.save_summary_checkbox)
+
+        self.save_excel_checkbox = QCheckBox("Edges & summaries (CSV)")
+        self.save_excel_checkbox.setChecked(self.save_excel)
+        self.save_excel_checkbox.stateChanged.connect(self._sync_save_flags)
+        save_layout.addWidget(self.save_excel_checkbox)
+
+        self.export_loaded_button = QPushButton("Export loaded deco results")
+        self.export_loaded_button.clicked.connect(self._export_loaded_deco)
+        self.export_loaded_button.setEnabled(False)
+        save_layout.addWidget(self.export_loaded_button)
 
         results_folder_layout = QHBoxLayout()
         self.results_label = QLabel("No folder selected")
@@ -466,6 +826,7 @@ class EELSProcessingWidget(QWidget):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
         run_layout.addWidget(self.progress_bar)
+
         middle_column_layout.addLayout(run_layout)
 
         reset_layout = QHBoxLayout()
@@ -478,6 +839,15 @@ class EELSProcessingWidget(QWidget):
         left_column_layout.addStretch()
         middle_column_layout.addStretch()
 
+        # Log toggle at the bottom of the middle column: the stretch above
+        # pushes it past the filler, flush with the bottom rim of the window.
+        self.log_toggle_button = QPushButton("Hide log")
+        self.log_toggle_button.clicked.connect(self._toggle_log)
+        toggle_row = QHBoxLayout()
+        toggle_row.addStretch()
+        toggle_row.addWidget(self.log_toggle_button)
+        middle_column_layout.addLayout(toggle_row)
+
         left_widget = QWidget()
         left_widget.setLayout(left_column_layout)
 
@@ -485,6 +855,9 @@ class EELSProcessingWidget(QWidget):
         middle_widget.setLayout(middle_column_layout)
 
         content_layout = QHBoxLayout()
+        # Columns span the full splitter height so the log toggle can reach
+        # the bottom rim of the window.
+        content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.addWidget(left_widget)
         content_layout.addWidget(middle_widget)
         content_layout.setStretch(0, 1)
@@ -501,12 +874,14 @@ class EELSProcessingWidget(QWidget):
         log_layout.addWidget(self.log_view)
         log_group.setLayout(log_layout)
         log_group.setMinimumWidth(360)
+        self.log_group = log_group
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(content_panel)
         splitter.addWidget(log_group)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        self.log_splitter = splitter
 
         outer_layout = QHBoxLayout()
         outer_layout.addWidget(splitter)
@@ -548,7 +923,20 @@ class EELSProcessingWidget(QWidget):
 
         self._logger.info("Logging initialized")
 
+        # Log unhandled exceptions instead of letting PyQt abort the process.
+        self._original_excepthook = sys.excepthook
+        sys.excepthook = self._excepthook
+
+    def _excepthook(self, exc_type, exc_value, exc_tb):
+        self._logger.error(
+            "Unhandled exception", exc_info=(exc_type, exc_value, exc_tb)
+        )
+
     def _restore_logging(self):
+        if getattr(self, "_original_excepthook", None) is not None:
+            sys.excepthook = self._original_excepthook
+            self._original_excepthook = None
+
         if self._original_stdout is not None:
             sys.stdout = self._original_stdout
             self._original_stdout = None
@@ -574,9 +962,11 @@ class EELSProcessingWidget(QWidget):
         )
         if sys.platform.startswith("linux"):
             dlg = MultiFolderDialog(
-                self, "Select Source Folder(s)", start_dir=start_dir
+                self,
+                "Select Source Folder(s) or a deco file",
+                start_dir=start_dir,
             )
-            folders = dlg.selected_folders() if dlg.exec_() else []
+            paths = dlg.selected_paths() if dlg.exec_() else []
         else:
             dlg = QFileDialog(self, "Select Source Folder(s)")
             if start_dir:
@@ -592,23 +982,315 @@ class EELSProcessingWidget(QWidget):
             if tree_view is not None:
                 tree_view.setSelectionMode(QAbstractItemView.MultiSelection)
 
-            folders = dlg.selectedFiles() if dlg.exec_() else []
+            paths = dlg.selectedFiles() if dlg.exec_() else []
 
-        if folders:
-            self.source_folders = folders
-            self.source_folder = folders[0] if len(folders) == 1 else None
-            self._preprocess_cache.clear()
-            self.folder_label.setText(
-                f"{len(folders)} folders selected"
-                if len(folders) > 1
-                else (
-                    f"...{folders[0][-40:]}"
-                    if len(folders[0]) > 40
-                    else folders[0]
-                )
+        if not paths:
+            return
+
+        if len(paths) == 1 and os.path.isfile(paths[0]):
+            self._load_deco(paths[0])
+            return
+
+        if not all(os.path.isdir(p) for p in paths):
+            self._set_status(
+                "Error: Select either one deco (.pkl) file or several folders"
             )
-            self.status_label.setText("Folder selected")
-            self._update_processing_mode_availability()
+            return
+
+        folders = paths
+        self._loaded_deco = None
+        self.source_folders = folders
+        self.source_folder = folders[0] if len(folders) == 1 else None
+        self._create_session()
+        self.folder_label.setText(
+            f"{len(folders)} folders selected"
+            if len(folders) > 1
+            else (
+                f"...{folders[0][-40:]}"
+                if len(folders[0]) > 40
+                else folders[0]
+            )
+        )
+        self._set_status("Folder selected")
+        self._update_processing_mode_availability()
+
+    def _load_deco(self, path: str):
+        """Load one EELSNMF deco object and restore its parameters."""
+        try:
+            from EELSNMF import load as load_eelsnmf
+
+            deco = load_eelsnmf(path)
+        except Exception as exc:
+            self._set_status(f"Error: {exc}", exc_info=True)
+            return
+        name = os.path.splitext(os.path.basename(path))[0]
+        self._load_deco_into(deco, name)
+        self._set_status(f"Deco loaded: {name}")
+
+    def _load_deco_into(self, deco, name: str):
+        """Register an already-loaded deco object (see ``_load_deco``)."""
+        # A loaded deco is standalone: it detaches from the current folders.
+        self._loaded_deco = deco
+        self.source_folders = []
+        self.source_folder = None
+        self._session = None
+        self.folder_label.setText(f"Deco: {name}")
+        self._reset_model_combo()
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItem(name, deco)
+        self.model_combo.blockSignals(False)
+        self._update_save_options_availability()
+
+        self._update_params_from_deco(deco)
+
+    def _update_params_from_deco(self, deco):
+        """Push the parameters stored in *deco* back into the GUI.
+
+        Preprocessing parameters (median filter, mask) and colors are not
+        stored in deco objects and are left untouched.
+        """
+        restored, missing = [], []
+
+        def set_value(name, getter, apply, description):
+            try:
+                value = getter()
+            except AttributeError:
+                missing.append(name)
+                return
+            apply(value)
+            restored.append(f"{name} = {description}")
+
+        set_value(
+            "E0",
+            lambda: deco.E0 / 1e3,
+            lambda v: self.e0_spinbox.setValue(v),
+            "keV",
+        )
+        set_value(
+            "alpha",
+            lambda: deco.alpha * 1e3,
+            lambda v: self.alpha_spinbox.setValue(v),
+            "mrad",
+        )
+        set_value(
+            "beta",
+            lambda: deco.beta * 1e3,
+            lambda v: self.beta_spinbox.setValue(v),
+            "mrad",
+        )
+        set_value(
+            "max_iters",
+            lambda: deco.max_iters,
+            lambda v: self.iter_spinbox.setValue(int(v)),
+            "",
+        )
+        set_value(
+            "tol",
+            lambda: deco.tol,
+            lambda v: self.tol_spinbox.setValue(float(v)),
+            "",
+        )
+        set_value(
+            "error_skip_step",
+            lambda: deco.error_skip_step,
+            lambda v: self.error_skip_spinbox.setValue(int(v)),
+            "",
+        )
+        set_value(
+            "n_components",
+            lambda: deco.n_components,
+            lambda v: self.components_spinbox.setValue(int(v)),
+            "",
+        )
+
+        method = None
+        try:
+            method = deco.analysis_description["decomposition"]["method"]
+        except (AttributeError, KeyError, TypeError):
+            missing.append("decomposition_method")
+        if method in DECOMPOSITION_METHODS:
+            self.method_combo.setCurrentText(method)
+            restored.append(f"decomposition_method = {method}")
+        elif method is not None:
+            missing.append(f"decomposition_method ({method})")
+
+        try:
+            params = deco.analysis_description["decomposition"]["params"]
+            lam = params.get("lmbda", params.get("TV_lmbda"))
+            if lam is not None:
+                self.regularization_spinbox.setValue(float(lam))
+                restored.append(f"regularization = {lam}")
+        except (AttributeError, KeyError, TypeError):
+            missing.append("regularization")
+
+        try:
+            backgrounds = deco.model.backgrounds
+            self.power_laws_spinbox.setValue(int(len(backgrounds)))
+            restored.append("n_power_laws")
+        except (AttributeError, TypeError):
+            missing.append("n_power_laws")
+
+        try:
+            ranges = deco.fine_structure_ranges
+            entries = [
+                {
+                    "name": name,
+                    "min": float(lo),
+                    "max": float(hi),
+                    "checked": True,
+                }
+                for name, (lo, hi) in ranges.items()
+            ]
+            self._populate_ranges_table(entries)
+            restored.append(f"edge ranges ({len(entries)})")
+        except (AttributeError, TypeError):
+            missing.append("edge ranges")
+
+        if cupy_gpu_available():
+            try:
+                use_cupy = deco.analysis_description["decomposition"][
+                    "use_cupy"
+                ]
+                self.use_cupy_checkbox.setChecked(bool(use_cupy))
+                restored.append("use_cupy")
+            except (AttributeError, KeyError, TypeError):
+                missing.append("use_cupy")
+
+        self._logger.info(
+            "Restored from deco: %s. Not stored in deco (left unchanged): %s.",
+            ", ".join(restored) if restored else "nothing",
+            ", ".join(missing) if missing else "none",
+        )
+
+    def _create_session(self):
+        """(Re)create the processing session for the selected folders."""
+        if not self.source_folders:
+            self._session = None
+            return
+        loader = partial(
+            load_eml_folders,
+            preprocess=self.pre_mode,
+            despike_method=self.despike_method,
+        )
+        self._session = Session(
+            self.source_folders,
+            median_filter_size=self.median_filter_size,
+            loader=loader,
+        )
+        self._reset_model_combo()
+
+    def _reset_model_combo(self):
+        """Clear the model selector (no fitted model available anymore)."""
+        self._last_results = None
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.addItem("None (run processing first)", None)
+        self.model_combo.blockSignals(False)
+
+    def _set_status(self, message: str, *, exc_info=False):
+        """Update the status label; error messages are mirrored to the log."""
+        self.status_label.setText(message)
+        if message.startswith("Error") and self._logger is not None:
+            self._logger.error(message, exc_info=exc_info)
+
+    def _toggle_log(self):
+        """Collapse or expand the log panel, keeping the columns' shape.
+
+        Collapsing shrinks the top-level window by the log pane's width;
+        expanding restores it, so the left/middle columns never stretch.
+        """
+        show = self.log_group.isHidden()
+        if not show:
+            self._log_splitter_sizes = self.log_splitter.sizes()
+        self.log_group.setVisible(show)
+        self.log_toggle_button.setText("Hide log" if show else "Show log")
+        if show:
+            sizes = self._log_splitter_sizes
+            if sizes is None or sum(sizes) <= 0:
+                total = max(1, self.log_splitter.width())
+                sizes = [total * 3 // 5, total * 2 // 5]
+            self.log_splitter.setSizes(list(sizes))
+
+        # Resize the window so the columns keep their horizontal shape. The
+        # layout pins an explicit minimum size that includes the log pane, so
+        # relax it before shrinking.
+        if self.isWindow():
+            window = self.window()
+            sizes = self._log_splitter_sizes
+            log_width = sizes[1] if sizes else 0
+            if log_width > 0:
+                if not show:
+                    window.setMinimumSize(0, 0)
+                    window.resize(window.width() - log_width, window.height())
+                else:
+                    window.resize(window.width() + log_width, window.height())
+        if show:
+            sizes = self._log_splitter_sizes
+            if sizes is None or sum(sizes) <= 0:
+                total = max(1, self.log_splitter.width())
+                sizes = [total * 3 // 5, total * 2 // 5]
+            self.log_splitter.setSizes(list(sizes))
+
+    def _update_model_combo(self, results):
+        """Populate the model selector from the last run's decos."""
+        self._last_results = results
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        entries = []
+        if (
+            self.joint_mode
+            and results.joint is not None
+            and results.deco_joint is not None
+        ):
+            entries.append(("Joint", results.deco_joint))
+        for label, deco in zip(results.labels, results.decos_individual):
+            if deco is not None:
+                entries.append((label, deco))
+        if not entries:
+            self.model_combo.addItem("None (run processing first)", None)
+        for name, deco in entries:
+            self.model_combo.addItem(name, deco)
+        self.model_combo.blockSignals(False)
+
+    def _plot_from_model(self, method_name: str):
+        """Run an EELSNMF plot method on the model selected in the combo."""
+        deco = self.model_combo.currentData()
+        if deco is None:
+            self._set_status("Error: Run processing first")
+            return
+        try:
+            getattr(deco, method_name)()
+            plt.show(block=False)
+        except Exception as exc:  # pragma: no cover - UI error path
+            self._set_status(f"Error: {exc}", exc_info=True)
+
+    def _make_help_button(self, tooltip: str):
+        """A small outlined '?' button showing *tooltip* on hover (no delay)."""
+        button = HelpButton(self)
+        button.setText("?")
+        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        button.setFixedSize(18, 18)
+        button.setStyleSheet(
+            "QToolButton { border: 1px solid #8a8a8a; border-radius: 4px;"
+            " background: transparent; font-weight: bold; }"
+            " QToolButton:hover { background: #dddddd; }"
+        )
+        button.setToolTip(tooltip)
+        button.setFocusPolicy(Qt.NoFocus)
+        return button
+
+    def _update_median_availability(self):
+        """The Hampel median filter size only matters for Hampel despiking."""
+        self.median_filter_spinbox.setEnabled(
+            self.despike_method == "hampel"
+        )
+
+    def _on_despike_changed(self, _index):
+        """Switch despiking algorithm and rebuild the session (data reload)."""
+        self.despike_method = self.despike_combo.currentData()
+        self._update_median_availability()
+        self._create_session()
 
     def _on_e0_changed(self, value):
         """Update beam energy parameter."""
@@ -626,9 +1308,58 @@ class EELSProcessingWidget(QWidget):
         """Update maximum iterations parameter."""
         self.max_iters = value
 
+    def _on_tol_changed(self, value):
+        """Update convergence tolerance parameter."""
+        self.tol = float(value)
+
+    def _on_error_skip_step_changed(self, value):
+        """Update error skip step parameter."""
+        self.error_skip_step = int(value)
+
+    def _on_decomposition_method_changed(self, method_name):
+        """Update decomposition method; regularization only applies to some."""
+        self.decomposition_method = method_name
+        self._update_regularization_availability()
+
+    def _on_regularization_changed(self, value):
+        """Update regularization lambda parameter."""
+        self.regularization = float(value)
+
+    def _update_regularization_availability(self):
+        """Grey out the lambda spinbox for methods without regularization."""
+        enabled = self.decomposition_method in REGULARIZED_METHODS
+        self.regularization_spinbox.setEnabled(enabled)
+        if enabled:
+            self.regularization_spinbox.setToolTip(
+                "Regularization lambda of the selected method"
+            )
+        else:
+            self.regularization_spinbox.setToolTip(
+                "The selected decomposition method has no regularization"
+            )
+
+    def _on_n_power_laws_changed(self, value):
+        """Update the number of power-law backgrounds in G."""
+        self.n_power_laws = int(value)
+
+    def _decomposition_settings(self) -> dict:
+        """Current decomposition parameters, as passed to Session.run."""
+        regularization = self.regularization
+        if self.decomposition_method not in REGULARIZED_METHODS:
+            regularization = None
+        return {
+            "n_power_laws": self.n_power_laws,
+            "tol": self.tol,
+            "error_skip_step": self.error_skip_step,
+            "decomposition_method": self.decomposition_method,
+            "regularization": regularization,
+        }
+
     def _on_median_filter_size_changed(self, value):
         """Update median filter size parameter."""
         self.median_filter_size = value
+        if self._session is not None:
+            self._session.set_median_filter_size(value)
 
     def _on_mask_enabled_changed(self, value):
         self.mask_enabled = self.mask_checkbox.isChecked()
@@ -638,24 +1369,24 @@ class EELSProcessingWidget(QWidget):
         self.mask_dilation_iters = int(value)
 
     def _preview_mask(self):
-        if not self.source_folders:
-            self.status_label.setText("Error: No folder selected")
+        if not self.source_folders or self._session is None:
+            self._set_status("Error: No folder selected")
             return
 
         try:
-            previews = build_mask_preview_for_folders(
-                self.source_folders,
-                median_filter_size=self.median_filter_size,
-                dilation_iters=self.mask_dilation_iters,
-                mode="mean",
-                preprocess_cache=self._preprocess_cache,
+            previews = self._session.mask_preview(
+                MaskParams(
+                    enabled=True,
+                    dilation_iters=self.mask_dilation_iters,
+                    mode="mean",
+                )
             )
         except Exception as exc:  # pragma: no cover - UI error path
-            self.status_label.setText(f"Error: {exc}")
+            self._set_status(f"Error: {exc}", exc_info=True)
             return
 
         if not previews:
-            self.status_label.setText("Error: No previews available")
+            self._set_status("Error: No previews available")
             return
 
         n = len(previews)
@@ -707,14 +1438,30 @@ class EELSProcessingWidget(QWidget):
         enabled = self.save_results
         self.results_label.setEnabled(enabled)
         self.results_button.setEnabled(enabled)
+        for checkbox in (
+            self.save_deco_checkbox,
+            self.save_pickle_checkbox,
+            self.save_colored_checkbox,
+            self.save_masks_checkbox,
+            self.save_original_checkbox,
+            self.save_summary_checkbox,
+            self.save_excel_checkbox,
+        ):
+            checkbox.setEnabled(enabled)
+        self.export_loaded_button.setEnabled(
+            enabled and self._loaded_deco is not None
+        )
 
-    def _on_save_results_changed(self, value):
+    def _sync_save_flags(self, _value=None):
+        """Read all saving checkboxes into the corresponding flags."""
         self.save_results = self.save_results_checkbox.isChecked()
-        self.save_colored_images = self.save_results
-        self.save_original_images = self.save_results
-        self.save_summary_plot = self.save_results
-        self.save_excel = self.save_results
-        self.show_summary_plot = True
+        self.save_deco = self.save_deco_checkbox.isChecked()
+        self.save_pickle = self.save_pickle_checkbox.isChecked()
+        self.save_colored_images = self.save_colored_checkbox.isChecked()
+        self.save_masks = self.save_masks_checkbox.isChecked()
+        self.save_original_images = self.save_original_checkbox.isChecked()
+        self.save_summary_plot = self.save_summary_checkbox.isChecked()
+        self.save_excel = self.save_excel_checkbox.isChecked()
         self._update_save_options_availability()
 
     def _on_processing_mode_changed(self, value):
@@ -722,6 +1469,10 @@ class EELSProcessingWidget(QWidget):
         self.process_joint = self.process_joint_checkbox.isChecked()
 
     def _update_processing_mode_availability(self):
+        if not self.joint_mode:
+            # Individual processing is forced; the selector is hidden.
+            return
+
         folder_count = len(self.source_folders)
 
         if folder_count == 0:
@@ -860,15 +1611,15 @@ class EELSProcessingWidget(QWidget):
                 continue
             name = entry["name"].strip()
             if not name:
-                self.status_label.setText("Error: Range name cannot be empty")
+                self._set_status("Error: Range name cannot be empty")
                 return None
             if name in ranges:
-                self.status_label.setText(
+                self._set_status(
                     f"Error: Duplicate range name '{name}'"
                 )
                 return None
             if entry["min"] >= entry["max"]:
-                self.status_label.setText(
+                self._set_status(
                     f"Error: Range '{name}' min must be < max"
                 )
                 return None
@@ -929,7 +1680,7 @@ class EELSProcessingWidget(QWidget):
     def _remove_selected_range(self):
         row = self.ranges_table.currentRow()
         if row < 0:
-            self.status_label.setText("Error: No range selected")
+            self._set_status("Error: No range selected")
             return
         self.ranges_table.removeRow(row)
 
@@ -960,6 +1711,11 @@ class EELSProcessingWidget(QWidget):
         self.max_iters = 2000
         self.median_filter_size = 11
         self.n_components = 2
+        self.tol = 1e-8
+        self.error_skip_step = 100
+        self.decomposition_method = "default_decomposition"
+        self.regularization = 0.1
+        self.n_power_laws = 50
         self.mask_enabled = False
         self.mask_dilation_iters = 1
         self.colors = [
@@ -969,20 +1725,38 @@ class EELSProcessingWidget(QWidget):
             np.array([1.0, 0.5, 0.0]),
         ]
         self.save_results = False
+        self.save_deco = True
+        self.save_pickle = False
         self.save_colored_images = False
+        self.save_masks = False
         self.save_original_images = False
         self.save_summary_plot = False
         self.show_summary_plot = True
         self.save_excel = False
         self.process_individual = True
         self.process_joint = False
-        self._preprocess_cache.clear()
+        if self._session is not None:
+            self._session.set_median_filter_size(self.median_filter_size)
 
         self.e0_spinbox.setValue(self.e0)
         self.alpha_spinbox.setValue(self.alpha)
         self.beta_spinbox.setValue(self.beta)
         self.iter_spinbox.setValue(self.max_iters)
+        self.tol_spinbox.setValue(self.tol)
+        self.error_skip_spinbox.setValue(self.error_skip_step)
+        self.method_combo.setCurrentText(self.decomposition_method)
+        self.regularization_spinbox.setValue(self.regularization)
+        self.power_laws_spinbox.setValue(self.n_power_laws)
         self.median_filter_spinbox.setValue(self.median_filter_size)
+        index = self.despike_combo.findData(self.despike_method)
+        self.despike_combo.setCurrentIndex(max(index, 0))
+        self.save_deco_checkbox.setChecked(self.save_deco)
+        self.save_pickle_checkbox.setChecked(self.save_pickle)
+        self.save_colored_checkbox.setChecked(self.save_colored_images)
+        self.save_masks_checkbox.setChecked(self.save_masks)
+        self.save_original_checkbox.setChecked(self.save_original_images)
+        self.save_summary_checkbox.setChecked(self.save_summary_plot)
+        self.save_excel_checkbox.setChecked(self.save_excel)
         self.mask_checkbox.setChecked(self.mask_enabled)
         self.mask_dilation_spinbox.setValue(self.mask_dilation_iters)
         self.mask_dilation_spinbox.setEnabled(self.mask_enabled)
@@ -999,7 +1773,7 @@ class EELSProcessingWidget(QWidget):
 
         self._rebuild_color_buttons()
         self._save_settings()
-        self.status_label.setText("Defaults restored")
+        self._set_status("Defaults restored")
 
     def _update_color_button(self, button, rgb_array):
         """Update button background to reflect chosen color."""
@@ -1011,12 +1785,12 @@ class EELSProcessingWidget(QWidget):
         )
         text_color = "white" if luminance < 0.5 else "black"
         button.setStyleSheet(
-            f"background-color: rgb({r}, {g}, {b}); " f"color: {text_color};"
+            f"background-color: rgb({r}, {g}, {b}); color: {text_color};"
         )
 
     def _plot_energy_ranges(self):
-        if not self.source_folders:
-            self.status_label.setText("Error: No folder selected")
+        if not self.source_folders or self._session is None:
+            self._set_status("Error: No folder selected")
             return
 
         fine_structure_ranges = self._collect_ranges(only_enabled=True)
@@ -1024,77 +1798,69 @@ class EELSProcessingWidget(QWidget):
             return
 
         if not fine_structure_ranges:
-            self.status_label.setText("Error: Select at least one edge")
+            self._set_status("Error: Select at least one edge")
             return
 
-        list_decos = build_deco_for_folders_to_plot_er(
-            self.source_folders,
-            E0_V=self.e0 * 1e3,
-            alpha_rad=self.alpha * 1e-3,
-            beta_rad=self.beta * 1e-3,
-            median_filter_size=self.median_filter_size,
-            fine_structure_ranges=fine_structure_ranges,
-            mask_enabled=self.mask_enabled,
-            mask_dilation_iters=self.mask_dilation_iters,
-            mask_mode="mean",
-            preprocess_cache=self._preprocess_cache,
-        )
-
-        plot_energy_ranges(list_decos, fine_structure_ranges)
+        try:
+            list_decos = self._session.decos_with_g(
+                self._beam_params(),
+                fine_structure_ranges,
+                self._mask_params(),
+                n_power_laws=self.n_power_laws,
+            )
+            plot_energy_ranges(list_decos, fine_structure_ranges)
+        except Exception as exc:  # pragma: no cover - UI error path
+            self._set_status(f"Error: {exc}", exc_info=True)
 
     def _plot_explained_variance_ratio(self):
-        if not self.source_folders:
-            self.status_label.setText("Error: No folder selected")
+        if not self.source_folders or self._session is None:
+            self._set_status("Error: No folder selected")
             return
 
         if not (self.process_individual or self.process_joint):
-            self.status_label.setText("Error: Select a processing mode")
+            self._set_status("Error: Select a processing mode")
             return
 
         only_joint = self.process_joint
-        items = build_scree_plot_inputs(
-            self.source_folders,
-            E0_V=self.e0 * 1e3,
-            alpha_rad=self.alpha * 1e-3,
-            beta_rad=self.beta * 1e-3,
-            median_filter_size=self.median_filter_size,
-            process_individual=(self.process_individual and not only_joint),
-            process_joint=only_joint,
-            mask_enabled=self.mask_enabled,
-            mask_dilation_iters=self.mask_dilation_iters,
-            mask_mode="mean",
-            preprocess_cache=self._preprocess_cache,
-        )
-
-        if not items:
-            self.status_label.setText("Error: No data available")
-            return
-
-        fig, axes = plt.subplots(
-            nrows=len(items),
-            ncols=1,
-            figsize=(7, max(3, 2.8 * len(items))),
-            constrained_layout=True,
-        )
-        axes_list = (
-            [axes] if not isinstance(axes, (list, np.ndarray)) else axes
-        )
-
-        for ax, (label, sl) in zip(axes_list, items):
-            sl.unfolded_si.decomposition()
-            sl.unfolded_si.plot_explained_variance_ratio(
-                fig=fig,
-                ax=ax,
-                n=10,
+        try:
+            items = self._session.list_of_si(
+                individual=(self.process_individual and not only_joint),
+                joint=only_joint,
             )
-            tick_count = 10
-            tick_positions = list(range(tick_count))
-            tick_labels = [self._ordinal_label(i + 1) for i in tick_positions]
-            ax.set_xticks(tick_positions)
-            ax.set_xticklabels(tick_labels)
-            ax.set_title(label)
 
-        plt.show(block=False)
+            if not items:
+                self._set_status("Error: No data available")
+                return
+
+            fig, axes = plt.subplots(
+                nrows=len(items),
+                ncols=1,
+                figsize=(7, max(3, 2.8 * len(items))),
+                constrained_layout=True,
+            )
+            axes_list = (
+                [axes] if not isinstance(axes, (list, np.ndarray)) else axes
+            )
+
+            for ax, (label, sl) in zip(axes_list, items):
+                sl.unfolded_si.decomposition()
+                sl.unfolded_si.plot_explained_variance_ratio(
+                    fig=fig,
+                    ax=ax,
+                    n=10,
+                )
+                tick_count = 10
+                tick_positions = list(range(tick_count))
+                tick_labels = [
+                    self._ordinal_label(i + 1) for i in tick_positions
+                ]
+                ax.set_xticks(tick_positions)
+                ax.set_xticklabels(tick_labels)
+                ax.set_title(label)
+
+            plt.show(block=False)
+        except Exception as exc:  # pragma: no cover - UI error path
+            self._set_status(f"Error: {exc}", exc_info=True)
 
     def _pick_color(self, component_idx):
         """Open color picker dialog for component."""
@@ -1124,14 +1890,28 @@ class EELSProcessingWidget(QWidget):
             suffix = {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
         return f"{value}{suffix}"
 
+    def _beam_params(self) -> BeamParams:
+        return BeamParams(
+            E0_V=self.e0 * 1e3,
+            alpha_rad=self.alpha * 1e-3,
+            beta_rad=self.beta * 1e-3,
+        )
+
+    def _mask_params(self) -> MaskParams:
+        return MaskParams(
+            enabled=self.mask_enabled,
+            dilation_iters=self.mask_dilation_iters,
+            mode="mean",
+        )
+
     def _run_processing(self):
         """Execute EELS processing with current parameters."""
         if self._worker_thread is not None and self._worker_thread.isRunning():
-            self.status_label.setText("Processing already running")
+            self._set_status("Processing already running")
             return
 
-        if not self.source_folders:
-            self.status_label.setText("Error: No folder selected")
+        if not self.source_folders or self._session is None:
+            self._set_status("Error: No folder selected")
             return
 
         fine_structure_ranges = self._collect_ranges(only_enabled=True)
@@ -1139,54 +1919,45 @@ class EELSProcessingWidget(QWidget):
             return
 
         if not fine_structure_ranges:
-            self.status_label.setText("Error: Select at least one edge")
+            self._set_status("Error: Select at least one edge")
             return
 
         if not (self.process_individual or self.process_joint):
-            self.status_label.setText("Error: Select a processing mode")
+            self._set_status("Error: Select a processing mode")
             return
 
         if self.save_results and self.results_folder is None:
-            self.status_label.setText("Error: No results folder selected")
+            self._set_status("Error: No results folder selected")
             return
 
-        self.status_label.setText("Processing...")
+        self._set_status("Processing...")
 
         self._save_settings()
 
-        params = {
-            "source_folders": self.source_folders,
-            "E0_V": self.e0 * 1e3,
-            "alpha_rad": self.alpha * 1e-3,
-            "beta_rad": self.beta * 1e-3,
-            "max_iters": self.max_iters,
-            "median_filter_size": self.median_filter_size,
+        run_kwargs = {
+            "beam": self._beam_params(),
             "fine_structure_ranges": fine_structure_ranges,
-            "colors": self.colors,
             "n_components": self.n_components,
+            "max_iters": self.max_iters,
+            "mask": self._mask_params(),
+            "colors": self.colors,
             "process_individual": self.process_individual,
             "process_joint": self.process_joint,
-            "mask_enabled": self.mask_enabled,
-            "mask_dilation_iters": self.mask_dilation_iters,
-            "mask_mode": "mean",
-            # "preprocess_cache": self._preprocess_cache,
+            "use_cupy": self.use_cupy_checkbox.isChecked(),
+            **self._decomposition_settings(),
         }
 
-        print(f"Processing parameters:")
-        # for key, value in params.items():
-        #     if key in ["source_folders"]:
-        #         print(f"  {key}: {[os.path.basename(f) for f in value]}")
-        #     else:
-        #         print(f"  {key}: {value}")
-        print(params)
+        print("Processing parameters:")
+        print(run_kwargs)
 
         if self.debug:
             self.progress_bar.setVisible(True)
-            results = process_folders(**params)
+            results = self._session.run(**run_kwargs)
+            self._update_model_combo(results)
             self._export_and_save_processing_results(results)
             self.progress_bar.setVisible(False)
         else:
-            self._start_processing_on_thread(params)
+            self._start_processing_on_thread(run_kwargs)
 
     def _load_settings(self):
         settings = QSettings("eelsnmf-gui", "eelsnmf-gui")
@@ -1197,31 +1968,73 @@ class EELSProcessingWidget(QWidget):
         self.max_iters = settings.value(
             "params/max_iters", self.max_iters, type=int
         )
-        self.median_filter_size = settings.value(
-            "params/median_filter_size", self.median_filter_size, type=int
-        )
-        self.mask_enabled = settings.value(
-            "params/mask_enabled", self.mask_enabled, type=bool
-        )
-        self.mask_dilation_iters = settings.value(
-            "params/mask_dilation_iters",
-            self.mask_dilation_iters,
-            type=int,
-        )
+        if self.pre_mode:
+            # Preprocessing-only settings are not touched in non-pre mode so
+            # that both modes can share the same QSettings file.
+            self.median_filter_size = settings.value(
+                "params/median_filter_size", self.median_filter_size, type=int
+            )
+            self.mask_enabled = settings.value(
+                "params/mask_enabled", self.mask_enabled, type=bool
+            )
+            self.mask_dilation_iters = settings.value(
+                "params/mask_dilation_iters",
+                self.mask_dilation_iters,
+                type=int,
+            )
+        if self.joint_mode:
+            self.process_individual = settings.value(
+                "params/process_individual", self.process_individual, type=bool
+            )
+            self.process_joint = settings.value(
+                "params/process_joint", self.process_joint, type=bool
+            )
         self.n_components = settings.value(
             "params/n_components", self.n_components, type=int
         )
-        self.process_individual = settings.value(
-            "params/process_individual", self.process_individual, type=bool
+        self.tol = settings.value("params/tol", self.tol, type=float)
+        self.error_skip_step = settings.value(
+            "params/error_skip_step", self.error_skip_step, type=int
         )
-        self.process_joint = settings.value(
-            "params/process_joint", self.process_joint, type=bool
+        saved_method = settings.value(
+            "params/decomposition_method", self.decomposition_method
         )
+        if saved_method in DECOMPOSITION_METHODS:
+            self.decomposition_method = saved_method
+        self.regularization = settings.value(
+            "params/regularization", self.regularization, type=float
+        )
+        self.n_power_laws = settings.value(
+            "params/n_power_laws", self.n_power_laws, type=int
+        )
+        if self.pre_mode:
+            saved_despike = settings.value(
+                "params/despike_method", self.despike_method
+            )
+            if saved_despike in ("eml", "hampel"):
+                self.despike_method = saved_despike
         self.save_results = False
-        self.save_colored_images = False
-        self.save_original_images = False
-        self.save_summary_plot = False
-        self.save_excel = False
+        self.save_deco = settings.value(
+            "saving/deco_objects", self.save_deco, type=bool
+        )
+        self.save_pickle = settings.value(
+            "saving/full_pickle", self.save_pickle, type=bool
+        )
+        self.save_colored_images = settings.value(
+            "saving/colored_images", self.save_colored_images, type=bool
+        )
+        self.save_masks = settings.value(
+            "saving/mask_images", self.save_masks, type=bool
+        )
+        self.save_original_images = settings.value(
+            "saving/original_images", self.save_original_images, type=bool
+        )
+        self.save_summary_plot = settings.value(
+            "saving/summary_plot", self.save_summary_plot, type=bool
+        )
+        self.save_excel = settings.value(
+            "saving/edges_csv", self.save_excel, type=bool
+        )
         self.show_summary_plot = True
 
         self.colors = self._settings_colors(
@@ -1240,17 +2053,38 @@ class EELSProcessingWidget(QWidget):
         settings.setValue("params/alpha", self.alpha)
         settings.setValue("params/beta", self.beta)
         settings.setValue("params/max_iters", self.max_iters)
-        settings.setValue("params/median_filter_size", self.median_filter_size)
-        settings.setValue("params/mask_enabled", self.mask_enabled)
-        settings.setValue(
-            "params/mask_dilation_iters", self.mask_dilation_iters
-        )
+        if self.pre_mode:
+            settings.setValue(
+                "params/median_filter_size", self.median_filter_size
+            )
+            settings.setValue("params/mask_enabled", self.mask_enabled)
+            settings.setValue(
+                "params/mask_dilation_iters", self.mask_dilation_iters
+            )
+            settings.setValue("params/despike_method", self.despike_method)
+        if self.joint_mode:
+            settings.setValue(
+                "params/process_individual", self.process_individual
+            )
+            settings.setValue("params/process_joint", self.process_joint)
         settings.setValue("params/n_components", self.n_components)
-        settings.setValue("params/process_individual", self.process_individual)
-        settings.setValue("params/process_joint", self.process_joint)
+        settings.setValue("params/tol", self.tol)
+        settings.setValue("params/error_skip_step", self.error_skip_step)
+        settings.setValue(
+            "params/decomposition_method", self.decomposition_method
+        )
+        settings.setValue("params/regularization", self.regularization)
+        settings.setValue("params/n_power_laws", self.n_power_laws)
         settings.setValue(
             "params/colors", [color.tolist() for color in self.colors]
         )
+        settings.setValue("saving/deco_objects", self.save_deco)
+        settings.setValue("saving/full_pickle", self.save_pickle)
+        settings.setValue("saving/colored_images", self.save_colored_images)
+        settings.setValue("saving/mask_images", self.save_masks)
+        settings.setValue("saving/original_images", self.save_original_images)
+        settings.setValue("saving/summary_plot", self.save_summary_plot)
+        settings.setValue("saving/edges_csv", self.save_excel)
 
         settings.setValue("edges/ranges", self._get_ranges_list())
 
@@ -1299,13 +2133,13 @@ class EELSProcessingWidget(QWidget):
             )
         return legacy_colors if legacy_colors else fallback
 
-    def _start_processing_on_thread(self, params: dict):
+    def _start_processing_on_thread(self, run_kwargs: dict):
         print("[EELS] Starting processing thread")
         self.run_button.setEnabled(False)
         self.progress_bar.setVisible(True)
 
         self._worker_thread = QThread()
-        self._worker = _ProcessingWorker(params)
+        self._worker = _ProcessingWorker(self._session, run_kwargs)
         self._worker.moveToThread(self._worker_thread)
 
         self._worker_thread.started.connect(self._worker.run)
@@ -1320,10 +2154,11 @@ class EELSProcessingWidget(QWidget):
     def _on_processing_finished(self, results, error):
         print("[EELS] Processing thread finished")
         if error is not None:
-            self.status_label.setText(f"Error: {error}")
+            self._set_status(f"Error: {error}", exc_info=error)
             self._finish_processing_ui()
             return
 
+        self._update_model_combo(results)
         self._export_and_save_processing_results(results)
         self._finish_processing_ui()
 
@@ -1350,32 +2185,26 @@ class EELSProcessingWidget(QWidget):
         self._cleanup_thread("widget close")
         super().closeEvent(event)
 
-    def _save_pickled_results(self, results) -> None:
-        """Pickle the processing results and the EELSNMF deco objects.
+    def _ensure_pickle_dir(self) -> "str | None":
+        pickle_dir = os.path.join(self.results_folder, "pickles")
+        try:
+            os.makedirs(pickle_dir, exist_ok=True)
+            return pickle_dir
+        except Exception as exc:
+            print(f"Failed to create the pickle folder: {exc}")
+            return None
 
-        Everything is written into a dedicated ``pickles`` subfolder of the
-        results folder. The full ``ProcessFoldersResult`` (images, edges, W,
-        decos, ...) is written to ``processing_results.pkl``. In addition,
-        every deco object is saved with its own ``save`` method, which
-        pickles it without the hyperspy signals (see
+    def _save_deco_objects(self, results) -> None:
+        """Save every deco object of *results* with EELSNMF's own format.
+
+        Each deco is pickled without the hyperspy signals (see
         ``EELSNMF.__getstate__``) and, with ``save_hspy_objects=True``,
         stores the preprocessed signal (``cl``) alongside as a ``.hspy``
         file so that no data is lost.
         """
-        pickle_dir = os.path.join(self.results_folder, "pickles")
-        try:
-            os.makedirs(pickle_dir, exist_ok=True)
-        except Exception as exc:
-            print(f"Failed to create the pickle folder: {exc}")
+        pickle_dir = self._ensure_pickle_dir()
+        if pickle_dir is None:
             return
-
-        results_path = os.path.join(pickle_dir, "processing_results.pkl")
-        try:
-            with open(results_path, "wb") as fh:
-                pickle.dump(results, fh)
-            print(f"Pickled processing results to {results_path}")
-        except Exception as exc:
-            print(f"Failed to pickle the processing results: {exc}")
 
         decos = []
         if results.joint is not None and results.joint.deco is not None:
@@ -1399,9 +2228,134 @@ class EELSProcessingWidget(QWidget):
             except Exception as exc:
                 print(f"Failed to save the deco object '{fname}': {exc}")
 
+    def _save_full_pickle(self, results) -> None:
+        """Pickle the full ``ProcessFoldersResult`` (opt-in)."""
+        pickle_dir = self._ensure_pickle_dir()
+        if pickle_dir is None:
+            return
+
+        results_path = os.path.join(pickle_dir, "processing_results.pkl")
+        try:
+            with open(results_path, "wb") as fh:
+                pickle.dump(results, fh)
+            print(f"Pickled processing results to {results_path}")
+        except Exception as exc:
+            print(f"Failed to pickle the processing results: {exc}")
+
+    def _save_pickled_results(self, results) -> None:
+        """Backward-compatible wrapper: save decos and the full pickle."""
+        self._save_deco_objects(results)
+        self._save_full_pickle(results)
+
+    def _export_loaded_deco(self):
+        """Re-export the outputs of the loaded deco per the saving options."""
+        deco = self._loaded_deco
+        if deco is None:
+            self._set_status("Error: No deco loaded")
+            return
+        if not self.save_results or self.results_folder is None:
+            self._set_status("Error: No results folder selected")
+            return
+
+        try:
+            self._export_loaded_deco_impl(deco)
+        except Exception as exc:
+            self._set_status(f"Error: {exc}", exc_info=True)
+            return
+        self._set_status("Loaded deco exported")
+
+    def _export_loaded_deco_impl(self, deco):
+        ranges = getattr(deco, "fine_structure_ranges", None)
+        if not ranges:
+            raise ValueError("The loaded deco has no fine structure ranges")
+        n_components = int(getattr(deco, "n_components", 0) or 0)
+        if n_components < 1:
+            raise ValueError("The loaded deco has no fitted components")
+        self._ensure_color_count()
+        colors = self.colors[:n_components]
+        pickle_dir = os.path.join(self.results_folder, "pickles")
+
+        if self.save_deco:
+            os.makedirs(pickle_dir, exist_ok=True)
+            deco.save(
+                "deco_loaded",
+                path=pickle_dir,
+                save_hspy_objects=True,
+                overwrite=True,
+            )
+
+        edges = extract_edge_collection(deco, ranges, n_components)
+        totals = edge_totals(deco, ranges)
+        order = order_by_power(totals, n_components=n_components)
+        rows = summary_rows(totals, order) if totals is not None else None
+
+        if self.save_excel:
+            export_edges_by_label_to_csv(
+                edges.by_label, os.path.join(self.results_folder, "edges")
+            )
+            export_edge_contributions_summary_to_csv(
+                rows or [],
+                os.path.join(self.results_folder, "edge_contributions.csv"),
+            )
+
+        if self.save_colored_images:
+            from ._analysis import component_maps_from_deco
+
+            maps = component_maps_from_deco(deco, ranges)
+            if maps is None:
+                self._logger.info(
+                    "Cannot reconstruct images from this deco "
+                    "(joint or masked run); skipping image export."
+                )
+            else:
+                mixed, colored = apply_colors(maps, colors)
+                save_colored_images(
+                    [[img] for img in mixed],
+                    ["deco_loaded"],
+                    os.path.join(self.results_folder, "colored_images"),
+                )
+                for comp_idx, comp_maps in enumerate(colored):
+                    save_component_images(
+                        comp_maps,
+                        ["deco_loaded"],
+                        os.path.join(self.results_folder, "colored_images"),
+                        f"component_{comp_idx + 1}",
+                    )
+            if self.save_masks:
+                self._logger.info(
+                    "Mask images are not stored in deco objects; "
+                    "skipping mask export."
+                )
+            if self.save_original_images:
+                self._logger.info(
+                    "Original images are not stored in deco objects; "
+                    "skipping original image export."
+                )
+
+        if self.save_summary_plot and rows is not None:
+            from ._plotting import plot_joint_edges
+
+            fig, _ = plot_joint_edges(
+                edges.combined.norm,
+                edges.combined.x,
+                title="EELS Processing (loaded deco)",
+                colors=colors,
+                summary_table=rows,
+            )
+            save_summary_plot(
+                fig, os.path.join(self.results_folder, "summary_loaded.png")
+            )
+            if self.show_summary_plot:
+                plt.show(block=False)
+            else:
+                plt.close(fig)
+
     def _export_and_save_processing_results(self, results):
         if self.save_results and self.results_folder is not None:
-            self._save_pickled_results(results)
+            if self.save_deco:
+                self._save_deco_objects(results)
+            if self.save_pickle:
+                self._save_full_pickle(results)
 
         labels_individual = results.labels
         labels_joint = results.labels_joint
@@ -1490,12 +2444,6 @@ class EELSProcessingWidget(QWidget):
                 labels_individual,
                 os.path.join(self.results_folder, "colored_images"),
             )
-            if list_masks is not None:
-                save_mask_images(
-                    list_masks,
-                    labels_individual,
-                    os.path.join(self.results_folder, "mask_images"),
-                )
             if list_imgs_components is not None:
                 for comp_idx, comp_imgs in enumerate(list_imgs_components):
                     save_component_images(
@@ -1518,12 +2466,6 @@ class EELSProcessingWidget(QWidget):
                 labels_joint,
                 os.path.join(self.results_folder, "colored_images_joint"),
             )
-            if list_masks_joint is not None:
-                save_mask_images(
-                    list_masks_joint,
-                    labels_joint,
-                    os.path.join(self.results_folder, "mask_images_joint"),
-                )
             if list_imgs_components_joint is not None:
                 for comp_idx, comp_imgs in enumerate(
                     list_imgs_components_joint
@@ -1536,6 +2478,22 @@ class EELSProcessingWidget(QWidget):
                         ),
                         f"component_{comp_idx + 1}",
                     )
+
+        if self.save_masks and self.process_individual:
+            if list_masks is not None:
+                save_mask_images(
+                    list_masks,
+                    labels_individual,
+                    os.path.join(self.results_folder, "mask_images"),
+                )
+
+        if self.save_masks and self.process_joint:
+            if list_masks_joint is not None:
+                save_mask_images(
+                    list_masks_joint,
+                    labels_joint,
+                    os.path.join(self.results_folder, "mask_images_joint"),
+                )
 
         if self.save_original_images and self.process_joint:
             save_original_images(
@@ -1635,7 +2593,7 @@ class EELSProcessingWidget(QWidget):
                 )
             elif self.process_joint:
                 if edges_combined is None or x_axis_combined is None:
-                    self.status_label.setText("Error: Joint edges unavailable")
+                    self._set_status("Error: Joint edges unavailable")
                     fig = None
                 elif display_labels and plot_imgs:
                     fig, _ = self._create_joint_summary_with_images(
@@ -1674,7 +2632,7 @@ class EELSProcessingWidget(QWidget):
                 else:
                     plt.close(fig)
 
-        self.status_label.setText("Ready")
+        self._set_status("Ready")
 
     def _create_summary_plot(
         self,
@@ -1689,7 +2647,7 @@ class EELSProcessingWidget(QWidget):
         x_axis_combined,
         list_pixel_scales,
         *,
-        suptitle: Optional[str] = None,
+        suptitle: str | None = None,
         summary_tables=None,
         summary_joint=None,
     ):
@@ -1724,7 +2682,7 @@ class EELSProcessingWidget(QWidget):
         list_x_axis,
         list_pixel_scales,
         *,
-        suptitle: Optional[str] = None,
+        suptitle: str | None = None,
         summary_tables=None,
     ):
         from ._plotting import plot_image_grid_with_edges
@@ -1749,7 +2707,7 @@ class EELSProcessingWidget(QWidget):
         edges_combined,
         x_axis_combined,
         *,
-        suptitle: Optional[str] = None,
+        suptitle: str | None = None,
         summary_table=None,
     ):
         from ._plotting import plot_joint_edges
@@ -1774,7 +2732,7 @@ class EELSProcessingWidget(QWidget):
         x_axis_combined,
         list_pixel_scales,
         *,
-        suptitle: Optional[str] = None,
+        suptitle: str | None = None,
     ):
         from ._plotting import plot_joint_summary_with_images
 
