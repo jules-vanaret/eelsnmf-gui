@@ -210,9 +210,7 @@ class StubEngine:
                 "n_power_laws": n_power_laws,
             }
         )
-        deco.fine_structure_ranges = dict(fine_structure_ranges)
-
-        # One basis column per edge channel (delta spectrum placed at the
+        deco.fine_structure_ranges = dict(fine_structure_ranges)        # One basis column per edge channel (delta spectrum placed at the
         # channel energy), plus a few smooth background columns. Edge slices
         # address the *basis* axis of G/W, as in EELSNMF.
         slices = {}
@@ -232,6 +230,10 @@ class StubEngine:
         G[:, col:] = 0.1
         deco.G = G
         deco.model._edge_slices = slices
+        # The first basis column of each edge plays the cross-section role.
+        deco.model.xsection_idx = {
+            label: slc.start for label, slc in slices.items()
+        }
 
     def decompose(
         self,
@@ -245,6 +247,7 @@ class StubEngine:
         error_skip_step=100,
         decomposition_method="default_decomposition",
         regularization=None,
+        fixed_weights=None,
     ):
         deco = bundle.deco
         self.decompose_calls.append(
@@ -260,6 +263,7 @@ class StubEngine:
                 "error_skip_step": error_skip_step,
                 "decomposition_method": decomposition_method,
                 "regularization": regularization,
+                "fixed_weights": tuple(fixed_weights or ()),
                 "mask_pixels": (
                     None
                     if deco.mask_flat is None

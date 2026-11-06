@@ -18,8 +18,8 @@ from ._results import (
     ProcessFoldersResult,
     ProcessingResult,
 )
-from .session import Session
 from ._widget import EELSProcessingWidget
+from .session import Session
 
 __all__ = (
     "EELSProcessingWidget",

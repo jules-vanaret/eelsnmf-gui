@@ -97,6 +97,33 @@ def test_end_to_end_run(tmp_path):
         assert processing_result.pixel_scale == 0.2
 
 
+def test_excluded_element_cannot_appear_in_component(tmp_path):
+    """'Excluded' zero-fixes the element's W rows (xsection + fine structure)."""
+    session = _make_session(tmp_path)
+    result = session.run(
+        beam=BeamParams(E0_V=300_000.0, alpha_rad=0.0154, beta_rad=0.01846),
+        fine_structure_ranges=RANGES,
+        n_components=2,
+        max_iters=30,
+        colors=[np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])],
+        fixed_weights=(("O_K", 1, "excluded"),),
+        process_joint=False,
+    )
+
+    deco = result.individual[0].deco
+    assert deco.W_fixed_bool is not None
+    xs_idx = deco.model.xsection_idx["O_K"]
+    slc = deco.model._edge_slices["O_K"]
+    rows = [xs_idx] + list(range(slc.start, slc.stop))
+    # The constraint values are exactly zero; W ends at the eps floor
+    # (EELSNMF shifts W away from strict zeros to avoid 0-locking), i.e.
+    # the element's contribution to component 1 is effectively nil.
+    assert np.all(deco.W_fixed_values[rows, 1] == 0.0)
+    assert np.allclose(deco.W[rows, 1], 0.0, atol=1e-9)
+    # The other component is unaffected by the constraint.
+    assert deco.W[rows, 0].sum() > 0
+
+
 def test_end_to_end_run_with_user_masks(tmp_path):
     """User masks flow through the real engine and zero masked-out pixels."""
     session = _make_session(tmp_path)

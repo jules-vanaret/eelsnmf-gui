@@ -487,6 +487,65 @@ def test_export_loaded_deco(qtbot, tmp_path):
     assert widget.status_label.text() == "Loaded deco exported"
 
 
+def test_fixed_weights_table(qtbot):
+    """Constraint rows collect only constrained, valid (edge, comp, mode)."""
+    widget = EELSProcessingWidget(debug=True)
+    qtbot.addWidget(widget)
+
+    widget._add_fixed_weight_row("Fe_L", 0, "Fixed")
+    widget._add_fixed_weight_row("O_K", 1, "Free")  # no effect
+    widget._add_fixed_weight_row("Fe_L", 1, "Excluded")
+    assert widget._collect_fixed_weights() == (
+        ("Fe_L", 0, "fixed"),
+        ("Fe_L", 1, "excluded"),
+    )
+
+    # Remove the second constraint row (Fe_L, component 1).
+    widget.fixed_weights_table.selectRow(2)
+    widget._remove_selected_fixed_weight()
+    assert widget._collect_fixed_weights() == (("Fe_L", 0, "fixed"),)
+
+    # Validation: disabled edges and out-of-range components are skipped.
+    widget._add_fixed_weight_row("O_K", 0, "Excluded")  # O_K disabled
+    widget.n_components = 6
+    widget._add_fixed_weight_row("Fe_L", 5, "Fixed")
+    widget.n_components = 2  # component 5 is now out of range
+    assert widget._collect_fixed_weights() == (("Fe_L", 0, "fixed"),)
+
+    # Duplicate (edge, component) rows are deduplicated.
+    widget._add_fixed_weight_row("Fe_L", 0, "Fixed")
+    assert widget._collect_fixed_weights() == (("Fe_L", 0, "fixed"),)
+
+
+def test_fixed_weights_reach_run_and_settings(qtbot, tmp_path):
+    """Collected constraints are passed to Session.run and persisted."""
+    widget, run_kwargs = _make_widget_with_stub_run(qtbot, tmp_path)
+    widget.save_results_checkbox.setChecked(True)
+    widget._sync_save_flags()
+
+    widget._add_fixed_weight_row("Fe_L", 1, "Fixed")
+    widget._save_settings()
+    widget.fixed_weights_table.setRowCount(0)
+    assert widget._collect_fixed_weights() == ()
+
+    # Reload from settings: the row comes back with its state.
+    widget._load_settings()
+    assert widget._saved_fixed_weights == [("Fe_L", 1, "Fixed")]
+    for edge, component, state in widget._saved_fixed_weights:
+        widget._add_fixed_weight_row(edge, component, state)
+    assert widget._collect_fixed_weights() == (("Fe_L", 1, "fixed"),)
+
+    result = widget._session.run(
+        **{**run_kwargs, "fixed_weights": widget._collect_fixed_weights()}
+    )
+    engine = widget._session._engine
+    assert all(
+        call["fixed_weights"] == (("Fe_L", 1, "fixed"),)
+        for call in engine.decompose_calls
+    )
+    assert result.joint is not None or result.individual
+
+
 def test_model_combo_and_sanity_plots(qtbot):
     """A run's decos populate the model selector; buttons call the model's plots."""
     from tests.fakes import StubDeco

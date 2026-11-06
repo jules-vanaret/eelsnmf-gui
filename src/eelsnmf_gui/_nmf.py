@@ -113,6 +113,7 @@ class EmlEngine:
         error_skip_step: int = 100,
         decomposition_method: str = "default_decomposition",
         regularization: float | None = None,
+        fixed_weights: Sequence[Tuple[str, int, str]] | None = None,
     ) -> None:
         """Run the decomposition, optionally interpolating a W init.
 
@@ -122,9 +123,16 @@ class EmlEngine:
         "alternate_decomposition", "SumRule_decomposition",
         "EdgeTV_decomposition", "combinedTVSR_decomposition"). *regularization*
         is the lambda passed to the methods that use one (ignored otherwise).
+        *fixed_weights* is a sequence of (edge, component, mode) triples
+        constraining the decomposition: mode "fixed" freezes the edge's
+        cross-section weight in the given component at its initial value;
+        mode "excluded" additionally zero-fixes the edge's fine-structure
+        channels, so the element cannot appear in that component at all
+        (``W_fixed_bool``/``W_fixed_values`` in EELSNMF).
         """
         deco = bundle.deco
         kwargs: dict = {}
+        w_init_interp: np.ndarray | None = None
         if w_init is not None:
             if w_init.shape[0] == n_components:
                 # Interpolate W_init onto the number of model columns.
@@ -132,7 +140,7 @@ class EmlEngine:
                 range_old = np.linspace(0, 1, w_init.shape[0])
                 range_new = np.linspace(0, 1, s)
                 interpolator = interp1d(range_old, w_init, axis=0)
-                kwargs["W_init"] = interpolator(range_new)
+                w_init_interp = interpolator(range_new)
             else:
                 logger.info(
                     "W_init component count mismatch; ignoring W_init "
@@ -145,6 +153,32 @@ class EmlEngine:
             elif decomposition_method == "combinedTVSR_decomposition":
                 kwargs["TV_lmbda"] = regularization
                 kwargs["SR_lmbda"] = regularization
+
+        if fixed_weights:
+            # Freeze the pinned W entries at their initial value: compute the
+            # initial W exactly as the decomposition will, then pass it as
+            # W_init so the init and the constraints agree.
+            deco.n_components = n_components
+            if w_init_interp is not None:
+                initial_w = w_init_interp
+            else:
+                deco.W_init = None
+                deco.H_init = None
+                deco.init_nmf = None
+                deco.random_state_nmf = None
+                # Set what decomposition() would set before its own init
+                # (_default_init_WH relies on self.eps).
+                deco.eps = 1e-10
+                deco._default_init_WH()
+                initial_w = np.asarray(deco.W, dtype=float).copy()
+            bool_arr, values_arr = self._build_W_fixed(
+                deco, fixed_weights, initial_w
+            )
+            kwargs["W_init"] = initial_w
+            kwargs["W_fixed_bool"] = bool_arr
+            kwargs["W_fixed_values"] = values_arr
+        elif w_init_interp is not None:
+            kwargs["W_init"] = w_init_interp
 
         if use_cupy is None:
             use_cupy = cupy_gpu_available()
@@ -159,3 +193,45 @@ class EmlEngine:
             decomposition_method=decomposition_method,
             **kwargs,
         )
+
+    @staticmethod
+    def _build_W_fixed(
+        deco,
+        fixed_weights: Sequence[Tuple[str, int, str]],
+        initial_w: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build the W_fixed_bool/W_fixed_values arrays from *fixed_weights*.
+
+        Each (edge, component, mode) triple pins rows of W in the given
+        component column:
+
+        - mode "fixed": the edge's cross-section weight
+          (``model.xsection_idx[edge]``) stays at its initial value;
+        - mode "excluded": the cross-section weight and all the edge's
+          fine-structure channels (``model._edge_slices[edge]``) are set to
+          zero, so the element cannot contribute to that component.
+        """
+        n_basis = deco.G.shape[1]
+        n_components = initial_w.shape[1]
+        bool_arr = np.zeros((n_basis, n_components), dtype=bool)
+        values_arr = initial_w.copy()
+        for edge, component, mode in fixed_weights:
+            if edge not in deco.model.xsection_idx:
+                raise ValueError(f"Unknown edge for fixed weight: {edge!r}")
+            if not 0 <= component < n_components:
+                raise ValueError(
+                    f"Fixed-weight component {component} out of range for "
+                    f"edge {edge!r}"
+                )
+            if mode not in ("fixed", "excluded"):
+                raise ValueError(f"Unknown fixed-weight mode: {mode!r}")
+
+            rows = [deco.model.xsection_idx[edge]]
+            if mode == "excluded":
+                slice_ = deco.model._edge_slices[edge]
+                rows.extend(range(slice_.start, slice_.stop))
+            for row in rows:
+                bool_arr[row, component] = True
+                if mode == "excluded":
+                    values_arr[row, component] = 0.0
+        return bool_arr, values_arr

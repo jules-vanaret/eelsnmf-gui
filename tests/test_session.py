@@ -348,6 +348,41 @@ def test_run_use_cupy_forwarded_and_part_of_spec(make_session):
     assert len(engine.decompose_calls) == 6  # backend change re-runs
 
 
+def test_run_fixed_weights_forwarded_and_part_of_spec(make_session):
+    """Fixed-weight constraints reach the engine; changing them re-runs."""
+    session = make_session()
+    engine = session._engine
+    session.run(**RUN_KWARGS, fixed_weights=(("Fe_L", 0, "fixed"),))
+    for call in engine.decompose_calls:
+        assert call["fixed_weights"] == (("Fe_L", 0, "fixed"),)
+
+    session.run(**RUN_KWARGS, fixed_weights=(("Fe_L", 0, "fixed"),))
+    assert len(engine.decompose_calls) == 3  # cached
+
+    session.run(
+        **RUN_KWARGS,
+        fixed_weights=(("Fe_L", 0, "fixed"), ("O_K", 1, "excluded")),
+    )
+    assert len(engine.decompose_calls) == 6  # constraints changed
+    # Order of the constraints does not matter for caching.
+    session.run(
+        **RUN_KWARGS,
+        fixed_weights=(("O_K", 1, "excluded"), ("Fe_L", 0, "fixed")),
+    )
+    assert len(engine.decompose_calls) == 6  # cached: same sorted set
+
+
+def test_run_fixed_weights_empty_is_none_like(make_session):
+    """An empty constraint tuple behaves like no constraints."""
+    session = make_session()
+    engine = session._engine
+    session.run(**RUN_KWARGS)
+    first = engine.decompose_calls[0]["fixed_weights"]
+    assert first == ()
+    session.run(**RUN_KWARGS, fixed_weights=())
+    assert len(engine.decompose_calls) == 3  # cached: () == no constraints
+
+
 def test_run_joint_only(make_session):
     """With only the joint mode, no individual results are produced."""
     session = make_session()

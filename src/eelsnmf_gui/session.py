@@ -85,6 +85,7 @@ class NmfEngine(Protocol):
         error_skip_step: int = 100,
         decomposition_method: str = "default_decomposition",
         regularization: float | None = None,
+        fixed_weights: Tuple[Tuple[str, int, str], ...] | None = None,
     ) -> None: ...
 
 
@@ -107,6 +108,17 @@ def _ranges_key(
     )
 
 
+def _fixed_weights_key(
+    fixed_weights: Sequence[Tuple[str, int, str]] | None,
+) -> Tuple[Tuple[str, int, str], ...]:
+    """Normalize fixed-weight constraints into a stable cache key."""
+    if not fixed_weights:
+        return ()
+    return tuple(
+        sorted((str(edge), int(comp), str(mode)) for edge, comp, mode in fixed_weights)
+    )
+
+
 @dataclass(frozen=True)
 class DecompositionSpec:
     """Identity of a decomposition, used to reuse fitted models."""
@@ -124,6 +136,7 @@ class DecompositionSpec:
     error_skip_step: int
     decomposition_method: str
     regularization: float | None
+    fixed_weights: tuple
 
 
 class Session:
@@ -362,6 +375,7 @@ class Session:
         error_skip_step: int = 100,
         decomposition_method: str = "default_decomposition",
         regularization: float | None = None,
+        fixed_weights: Sequence[Tuple[str, int, str]] | None = None,
         force: bool = False,
     ) -> ProcessFoldersResult:
         """Run joint and/or individual NMF decompositions.
@@ -373,7 +387,11 @@ class Session:
         selects the backend (None auto-detects a CUDA device).
         *n_power_laws* sizes the power-law background grid in G; *tol*,
         *error_skip_step*, *decomposition_method* and *regularization* are
-        forwarded to the EELSNMF decomposition.
+        forwarded to the EELSNMF decomposition. *fixed_weights* lists
+        (edge, component, mode) constraints: mode "fixed" freezes the edge's
+        cross-section weight in that component at its initial value, mode
+        "excluded" also zero-fixes its fine-structure channels so the
+        element cannot appear in that component.
         """
         mask = MaskParams() if mask is None else mask
         if not (process_individual or process_joint):
@@ -413,6 +431,7 @@ class Session:
                 error_skip_step=error_skip_step,
                 decomposition_method=decomposition_method,
                 regularization=regularization,
+                fixed_weights=fixed_weights,
                 force=force,
             )
             w_init = joint_result.W
@@ -447,6 +466,7 @@ class Session:
                     error_skip_step=error_skip_step,
                     decomposition_method=decomposition_method,
                     regularization=regularization,
+                    fixed_weights=fixed_weights,
                     force=force,
                 )
                 individual_results.append(result)
@@ -566,6 +586,7 @@ class Session:
         error_skip_step: int,
         decomposition_method: str,
         regularization: float | None,
+        fixed_weights: Sequence[Tuple[str, int, str]] | None,
         force: bool,
     ) -> ProcessingResult:
         spec = DecompositionSpec(
@@ -586,6 +607,7 @@ class Session:
             error_skip_step=error_skip_step,
             decomposition_method=decomposition_method,
             regularization=regularization,
+            fixed_weights=_fixed_weights_key(fixed_weights),
         )
 
         cached = self._decompositions.get(scope)
@@ -618,6 +640,7 @@ class Session:
                 error_skip_step=error_skip_step,
                 decomposition_method=decomposition_method,
                 regularization=regularization,
+                fixed_weights=_fixed_weights_key(fixed_weights),
             )
             self._decompositions[scope] = (spec, bundle)
 

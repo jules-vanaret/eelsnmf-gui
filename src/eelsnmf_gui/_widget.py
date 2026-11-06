@@ -35,8 +35,8 @@ from qtpy.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QToolTip,
     QToolButton,
+    QToolTip,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -230,6 +230,7 @@ class EELSProcessingWidget(QWidget):
         self.max_iters = 2000
         self.median_filter_size = 11
         self._saved_ranges = None
+        self._saved_fixed_weights = []
         self.n_components = 2
         self.tol = 1e-8
         self.error_skip_step = 100
@@ -501,6 +502,66 @@ class EELSProcessingWidget(QWidget):
         )
         power_laws_layout.addStretch()
         structure_layout.addLayout(power_laws_layout)
+
+        # Fixed weights: pin an element's cross-section weight to a component
+        fixed_header = QHBoxLayout()
+        fixed_header.addWidget(QLabel("Fixed weights (constraints):"))
+        fixed_header.addWidget(
+            self._make_help_button(
+                "Constrain the decomposition for the chosen element and "
+                "component:\n"
+                "- Free: no constraint.\n"
+                "- Fixed: the element's X-ray signature weight is frozen at "
+                "its initial value.\n"
+                "- Excluded: the signature and its fine-structure channels "
+                "are set to zero, so the element cannot appear in that "
+                "component at all.\n"
+                "Constraints are ignored if the edge is not enabled above "
+                "or the component is out of range."
+            )
+        )
+        fixed_header.addStretch()
+        structure_layout.addLayout(fixed_header)
+
+        self.fixed_weights_table = QTableWidget(0, 3)
+        self.fixed_weights_table.setHorizontalHeaderLabels(
+            ["Edge", "Component", "State"]
+        )
+        self.fixed_weights_table.verticalHeader().setVisible(False)
+        self.fixed_weights_table.setSelectionBehavior(
+            QAbstractItemView.SelectRows
+        )
+        self.fixed_weights_table.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self.fixed_weights_table.setFixedHeight(80)
+        self.fixed_weights_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.Stretch
+        )
+        self.fixed_weights_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeToContents
+        )
+        self.fixed_weights_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeToContents
+        )
+        structure_layout.addWidget(self.fixed_weights_table)
+
+        fixed_buttons_layout = QHBoxLayout()
+        self.add_fixed_weight_button = QPushButton("Add constraint")
+        self.add_fixed_weight_button.clicked.connect(
+            self._add_fixed_weight_row
+        )
+        fixed_buttons_layout.addWidget(self.add_fixed_weight_button)
+        self.remove_fixed_weight_button = QPushButton("Remove selected")
+        self.remove_fixed_weight_button.clicked.connect(
+            self._remove_selected_fixed_weight
+        )
+        fixed_buttons_layout.addWidget(self.remove_fixed_weight_button)
+        fixed_buttons_layout.addStretch()
+        structure_layout.addLayout(fixed_buttons_layout)
+
+        for edge, component, state in self._saved_fixed_weights:
+            self._add_fixed_weight_row(edge, component, state)
 
         structure_group.setLayout(structure_layout)
         left_column_layout.addWidget(structure_group)
@@ -1343,6 +1404,86 @@ class EELSProcessingWidget(QWidget):
         """Update the number of power-law backgrounds in G."""
         self.n_power_laws = int(value)
 
+    def _add_fixed_weight_row(
+        self, edge: str = "", component: int = 0, state: str = "Free"
+    ):
+        """Append a (Edge, Component, State) constraint row to the table."""
+        row = self.fixed_weights_table.rowCount()
+        self.fixed_weights_table.insertRow(row)
+
+        edge_combo = QComboBox()
+        for name in self._defined_edge_names():
+            edge_combo.addItem(name)
+        if edge:
+            edge_combo.setCurrentText(edge)
+        self.fixed_weights_table.setCellWidget(row, 0, edge_combo)
+
+        component_combo = QComboBox()
+        for i in range(max(self.n_components, 1)):
+            component_combo.addItem(f"Component {i + 1}")
+        component_combo.setCurrentIndex(
+            max(0, min(int(component), self.n_components - 1))
+        )
+        self.fixed_weights_table.setCellWidget(row, 1, component_combo)
+
+        state_combo = QComboBox()
+        state_combo.addItems(["Free", "Fixed", "Excluded"])
+        state_combo.setCurrentText(
+            state if state in ("Free", "Fixed", "Excluded") else "Free"
+        )
+        self.fixed_weights_table.setCellWidget(row, 2, state_combo)
+
+    def _remove_selected_fixed_weight(self):
+        """Remove the currently selected constraint row."""
+        row = self.fixed_weights_table.currentRow()
+        if row < 0:
+            self._set_status("Error: No constraint selected")
+            return
+        self.fixed_weights_table.removeRow(row)
+
+    def _defined_edge_names(self):
+        """Names of all edges defined in the ranges table."""
+        return [
+            entry["name"]
+            for entry in self._get_ranges_list()
+            if entry["name"].strip()
+        ]
+
+    def _collect_fixed_weights(self):
+        """Validated (edge, component) pairs whose state is 'Fixed'."""
+        enabled_edges = self._collect_ranges(only_enabled=True) or {}
+        fixed = []
+        seen = set()
+        for row in range(self.fixed_weights_table.rowCount()):
+            edge_combo = self.fixed_weights_table.cellWidget(row, 0)
+            component_combo = self.fixed_weights_table.cellWidget(row, 1)
+            state_combo = self.fixed_weights_table.cellWidget(row, 2)
+            if None in (edge_combo, component_combo, state_combo):
+                continue
+            state = state_combo.currentText()
+            if state not in ("Fixed", "Excluded"):
+                continue
+            edge = edge_combo.currentText().strip()
+            component = component_combo.currentIndex()
+            if edge not in enabled_edges:
+                self._logger.warning(
+                    "Fixed weight ignored: edge '%s' is not enabled", edge
+                )
+                continue
+            if not 0 <= component < self.n_components:
+                self._logger.warning(
+                    "Fixed weight ignored: component %d is out of range "
+                    "for edge '%s'",
+                    component + 1,
+                    edge,
+                )
+                continue
+            if (edge, component) in seen:
+                continue
+            seen.add((edge, component))
+            fixed.append((edge, component, state.lower()))
+        return tuple(fixed)
+
     def _decomposition_settings(self) -> dict:
         """Current decomposition parameters, as passed to Session.run."""
         regularization = self.regularization
@@ -1705,6 +1846,22 @@ class EELSProcessingWidget(QWidget):
                 return ranges
         return self._default_ranges()
 
+    def _load_fixed_weights_from_settings(self, settings):
+        """Restore the saved fixed-weight constraint rows."""
+        saved = settings.value("edges/fixed_weights")
+        rows = []
+        if isinstance(saved, (list, tuple)):
+            for entry in saved:
+                if isinstance(entry, (list, tuple)) and len(entry) == 3:
+                    edge, component, state = entry
+                    try:
+                        rows.append(
+                            (str(edge), int(component), str(state))
+                        )
+                    except (TypeError, ValueError):
+                        continue
+        return rows
+
     def _reset_to_defaults(self):
         self.e0 = 300.0
         self.alpha = 15.4
@@ -1771,6 +1928,7 @@ class EELSProcessingWidget(QWidget):
         self._update_save_options_availability()
 
         self._populate_ranges_table(self._default_ranges())
+        self.fixed_weights_table.setRowCount(0)
 
         self._rebuild_color_buttons()
         self._save_settings()
@@ -1946,6 +2104,7 @@ class EELSProcessingWidget(QWidget):
             "process_joint": self.process_joint,
             "use_cupy": self.use_cupy_checkbox.isChecked(),
             **self._decomposition_settings(),
+            "fixed_weights": self._collect_fixed_weights(),
         }
 
         print("Processing parameters:")
@@ -2047,6 +2206,9 @@ class EELSProcessingWidget(QWidget):
         self._ensure_color_count()
 
         self._saved_ranges = self._load_ranges_from_settings(settings)
+        self._saved_fixed_weights = self._load_fixed_weights_from_settings(
+            settings
+        )
 
     def _save_settings(self):
         settings = QSettings("eelsnmf-gui", "eelsnmf-gui")
@@ -2088,6 +2250,21 @@ class EELSProcessingWidget(QWidget):
         settings.setValue("saving/edges_csv", self.save_excel)
 
         settings.setValue("edges/ranges", self._get_ranges_list())
+        fixed_rows = []
+        for row in range(self.fixed_weights_table.rowCount()):
+            edge_combo = self.fixed_weights_table.cellWidget(row, 0)
+            component_combo = self.fixed_weights_table.cellWidget(row, 1)
+            state_combo = self.fixed_weights_table.cellWidget(row, 2)
+            if None in (edge_combo, component_combo, state_combo):
+                continue
+            fixed_rows.append(
+                [
+                    edge_combo.currentText(),
+                    component_combo.currentIndex(),
+                    state_combo.currentText(),
+                ]
+            )
+        settings.setValue("edges/fixed_weights", fixed_rows)
 
     @staticmethod
     def _settings_color(value, fallback: np.ndarray) -> np.ndarray:
