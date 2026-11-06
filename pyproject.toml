@@ -27,7 +27,7 @@ dependencies = [
     "numpy",
     "qtpy",
     "openpyxl",
-    "EELSNMF[EML] @ git+https://github.com/PauTorru/EELSNMF.git",
+    # "EELSNMF[EML] @ git+https://github.com/PauTorru/EELSNMF.git",
 ]
 
 [project.scripts]
