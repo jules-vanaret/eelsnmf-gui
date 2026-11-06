@@ -11,7 +11,7 @@ from functools import partial
 import matplotlib.pyplot as plt
 import numpy as np
 from qtpy.QtCore import QObject, QPoint, QSettings, Qt, QThread, Signal
-from qtpy.QtGui import QColor, QTextCursor, QToolTip
+from qtpy.QtGui import QColor, QTextCursor
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -35,6 +35,7 @@ from qtpy.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QToolButton,
     QTreeView,
     QVBoxLayout,
@@ -627,9 +628,9 @@ class EELSProcessingWidget(QWidget):
         method_layout.addWidget(
             self._make_help_button(
                 "Algorithm used for the decomposition.\n"
-                "default: standard NMF; default_kl: KL divergence; "
-                "alternate: alternating background/ELNES updates; "
-                "SumRule / EdgeTV / combinedTVSR: regularized variants "
+                "\tdefault: standard NMF; default_kl: KL divergence; \n"
+                "\talternate: alternating background/ELNES updates; \n"
+                "\tSumRule / EdgeTV / combinedTVSR: regularized variants"
                 "(these use the lambda parameter)."
             )
         )
