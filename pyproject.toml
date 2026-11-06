@@ -31,14 +31,14 @@ dependencies = [
 ]
 
 [project.scripts]
-eelsnmf-gui = "eelsnmf_gui.cli:main"
-eelsnmf_gui = "eelsnmf_gui.cli:main"
+eelsnmfgui = "eelsnmf_gui.cli:main"
 
 [dependency-groups]
 dev = [
     "tox-uv",
     "pytest",  # https://docs.pytest.org/en/latest/contents.html
     "pytest-cov",  # https://pytest-cov.readthedocs.io/en/latest/
+    "pytest-qt",  # https://pytest-qt.readthedocs.io/en/latest/
 ]
 
 
@@ -66,6 +66,9 @@ xfail_strict = true
 # filterwarnings = ["error"]  # recommended by PP309; deprecation warnings cause failures so leaving for the user to enable if desired
 log_cli_level = "INFO"
 testpaths = ["tests"]
+markers = [
+    "integration: end-to-end tests that require the EELSNMF backend (deselect with '-m \"not integration\"')",
+]
 
 [tool.black]
 line-length = 79
