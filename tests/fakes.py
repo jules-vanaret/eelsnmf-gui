@@ -169,6 +169,12 @@ class StubDeco:
     def plot_factors(self):
         self.plot_calls.append("plot_factors")
 
+    def plot_loadings(self):
+        self.plot_calls.append("plot_loadings")
+
+    def plot_edges(self, normalize=False):
+        self.plot_calls.append(("plot_edges", normalize))
+
 
 class StubEngine:
     """Deterministic engine double with two components of fixed power."""
@@ -246,7 +252,8 @@ class StubEngine:
         tol=1e-8,
         error_skip_step=100,
         decomposition_method="default_decomposition",
-        regularization=None,
+        regularization_tv=None,
+        regularization_sr=None,
         fixed_weights=None,
     ):
         deco = bundle.deco
@@ -262,7 +269,8 @@ class StubEngine:
                 "tol": tol,
                 "error_skip_step": error_skip_step,
                 "decomposition_method": decomposition_method,
-                "regularization": regularization,
+                "regularization_tv": regularization_tv,
+                "regularization_sr": regularization_sr,
                 "fixed_weights": tuple(fixed_weights or ()),
                 "mask_pixels": (
                     None

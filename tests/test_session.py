@@ -178,7 +178,7 @@ def test_decos_with_g(make_session):
 
 
 def test_run_forwards_decomposition_params(make_session):
-    """tol, error_skip_step, method, and regularization reach the engine."""
+    """tol, error_skip_step, method, and lambdas reach the engine."""
     session = make_session()
     engine = session._engine
     session.run(
@@ -186,19 +186,20 @@ def test_run_forwards_decomposition_params(make_session):
         tol=1e-6,
         error_skip_step=5,
         decomposition_method="SumRule_decomposition",
-        regularization=0.3,
+        regularization_sr=0.3,
         n_power_laws=11,
     )
     for call in engine.decompose_calls:
         assert call["tol"] == 1e-6
         assert call["error_skip_step"] == 5
         assert call["decomposition_method"] == "SumRule_decomposition"
-        assert call["regularization"] == 0.3
+        assert call["regularization_sr"] == 0.3
+        assert call["regularization_tv"] is None
     assert all(c["n_power_laws"] == 11 for c in engine.build_g_calls)
 
 
 def test_run_redecomposes_on_decomposition_param_changes(make_session):
-    """Changing tol, method, regularization, or power laws forces a new run."""
+    """Changing tol, method, lambdas, or power laws forces a new run."""
     session = make_session()
     engine = session._engine
     session.run(**RUN_KWARGS)
@@ -212,26 +213,37 @@ def test_run_redecomposes_on_decomposition_param_changes(make_session):
     assert len(engine.decompose_calls) == 9
     session.run(
         **{**RUN_KWARGS, "decomposition_method": "SumRule_decomposition"}
-    )  # no regularization -> same as method change only
+    )  # no lambdas -> same as method change only
     assert len(engine.decompose_calls) == 12
     session.run(
         **{
             **RUN_KWARGS,
             "decomposition_method": "SumRule_decomposition",
-            "regularization": 0.5,
+            "regularization_sr": 0.5,
         }
     )
     assert len(engine.decompose_calls) == 15
-    session.run(**{**RUN_KWARGS, "n_power_laws": 80})
+    session.run(
+        **{
+            **RUN_KWARGS,
+            "decomposition_method": "combinedTVSR_decomposition",
+            "regularization_tv": 0.2,
+        }
+    )
     assert len(engine.decompose_calls) == 18
+    session.run(**{**RUN_KWARGS, "n_power_laws": 80})
+    assert len(engine.decompose_calls) == 21
 
 
 def test_run_regularization_ignored_for_plain_methods(make_session):
-    """regularization is forwarded to the engine; filtering is the GUI's job."""
+    """lambdas are forwarded to the engine; filtering is the GUI's job."""
     session = make_session()
     engine = session._engine
-    session.run(**RUN_KWARGS, regularization=0.4)
-    assert all(c["regularization"] == 0.4 for c in engine.decompose_calls)
+    session.run(**RUN_KWARGS, regularization_tv=0.4, regularization_sr=0.7)
+    assert all(
+        c["regularization_tv"] == 0.4 and c["regularization_sr"] == 0.7
+        for c in engine.decompose_calls
+    )
 
 
 # ---------------------------------------------------------------------------
