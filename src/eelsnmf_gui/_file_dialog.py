@@ -1,6 +1,6 @@
 import os
 
-from qtpy.QtCore import QDir, QEvent, Qt
+from qtpy.QtCore import QDir, QEvent, QSortFilterProxyModel, Qt
 from qtpy.QtGui import QFileSystemModel
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -13,10 +13,45 @@ from qtpy.QtWidgets import (
 )
 
 
+def drop_ancestor_folders(paths):
+    """Drop paths that contain another selected path.
+
+    Selecting both a folder and its parent would load the same data
+    twice (the loader scans folders recursively), so only the most
+    specific selections are kept, in their original order.
+    """
+    kept = []
+    for path in paths:
+        if any(
+            path != other
+            and other.startswith(path + os.sep)
+            for other in paths
+        ):
+            continue
+        kept.append(path)
+    return kept
+
+
+class FolderOrDecoProxyModel(QSortFilterProxyModel):
+    """Show directories always; hide files except deco ``*.pkl`` pickles.
+
+    A plain ``QFileSystemModel`` name filter cannot do this: with
+    ``setNameFilterDisables(False)`` the ``*.pkl`` filter hides the
+    directories themselves.
+    """
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        model = self.sourceModel()
+        index = model.index(source_row, 0, source_parent)
+        if model.isDir(index):
+            return True
+        return model.fileName(index).lower().endswith(".pkl")
+
+
 class MultiFolderDialog(QDialog):
     """Dialog for selecting multiple folders or one deco .pkl file.
 
-    Folders and ``*.pkl`` files are listed; everything else is hidden.
+    Folders and ``*.pkl`` files are listed; other files are hidden.
     """
 
     def __init__(
@@ -32,9 +67,9 @@ class MultiFolderDialog(QDialog):
 
         self.model = QFileSystemModel(self)
         self.model.setFilter(QDir.Dirs | QDir.Files | QDir.NoDotAndDotDot)
-        self.model.setNameFilterDisables(False)
-        self.model.setNameFilters(["*.pkl"])
         self.model.setRootPath("")  # required for model to populate
+        self.proxy = FolderOrDecoProxyModel(self)
+        self.proxy.setSourceModel(self.model)
 
         self.path_edit = QLineEdit(self)
         self.path_edit.setPlaceholderText("Paste path to jump...")
@@ -43,7 +78,7 @@ class MultiFolderDialog(QDialog):
         layout.addWidget(self.path_edit)
 
         self.view = QTreeView(self)
-        self.view.setModel(self.model)
+        self.view.setModel(self.proxy)
         self.view.setHeaderHidden(True)
         self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -62,7 +97,7 @@ class MultiFolderDialog(QDialog):
         if start_dir:
             root_index = self.model.index(start_dir)
             if root_index.isValid():
-                self.view.setRootIndex(root_index)
+                self.view.setRootIndex(self.proxy.mapFromSource(root_index))
                 self.path_edit.setText(start_dir)
 
         self.view.selectionModel().selectionChanged.connect(
@@ -98,9 +133,9 @@ class MultiFolderDialog(QDialog):
         index = self.model.index(path)
         if not index.isValid():
             return
-        self.view.setRootIndex(index)
-        self.view.setCurrentIndex(index)
-        self.view.scrollTo(index)
+        self.view.setRootIndex(self.proxy.mapFromSource(index))
+        self.view.setCurrentIndex(self.proxy.mapFromSource(index))
+        self.view.scrollTo(self.proxy.mapFromSource(index))
 
     def _on_path_changed(self, text: str) -> None:
         path = text.strip()
@@ -122,22 +157,33 @@ class MultiFolderDialog(QDialog):
         return super().eventFilter(source, event)
 
     def selected_paths(self):
-        """Return selected paths (folders or one deco file), in order."""
-        # Use column 0 so we get one index per row
-        indexes = self.view.selectionModel().selectedRows(0)
+        """Return selected paths (folders or one deco file), in order.
+
+        Paths that contain another selected path are dropped: a dialog
+        quirk (observed on macOS with the stock QFileDialog) can report
+        both the clicked folder and its parent, which would load the
+        same data twice.
+        """
+        root_source = self.proxy.mapToSource(self.view.rootIndex())
+        root_path = (
+            self.model.filePath(root_source) if root_source.isValid() else None
+        )
         paths = []
-        for ix in indexes:
-            path = self.model.filePath(ix)
-            if path:
-                paths.append(path)
-        # De-duplicate while preserving order
         seen = set()
-        out = []
-        for p in paths:
-            if p not in seen:
-                seen.add(p)
-                out.append(p)
-        return out
+        for ix in self.view.selectionModel().selectedIndexes():
+            if ix.column() != 0:
+                continue
+            source_ix = self.proxy.mapToSource(ix)
+            path = self.model.filePath(source_ix)
+            # Skip the view's root directory itself (it can appear in the
+            # selection as a side effect of programmatic row selection).
+            if not path or path == root_path:
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+        return drop_ancestor_folders(paths)
 
     def selected_folders(self):
         """Return selected folder paths, deduplicated in selection order."""

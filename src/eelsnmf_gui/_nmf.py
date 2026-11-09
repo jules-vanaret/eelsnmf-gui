@@ -14,6 +14,55 @@ logger = logging.getLogger(__name__)
 
 _CUPY_AVAILABLE: bool | None = None
 
+_EDGE_CHOICES: list[str] | None = None
+
+# Fallback when pyEELSMODEL's element database cannot be read.
+_FALLBACK_EDGE_CHOICES = ("Fe_L", "O_K")
+
+
+def available_core_loss_edges() -> list[str]:
+    """'Element_Shell' names the EELSNMF cross-section models can fit.
+
+    EELSNMF splits each fine-structure name as ``element.split("_")`` and
+    builds a Kohl/Zezhong core-loss cross-section for it: the element must
+    exist in pyEELSMODEL's ``element_info.hdf5`` and the shell (K, L, M,
+    N, O) must have sub-edge data there. This enumerates exactly those
+    combinations. (Cached; falls back to the common edges when the
+    database cannot be read.)
+    """
+    global _EDGE_CHOICES
+    if _EDGE_CHOICES is None:
+        try:
+            import os
+
+            import h5py  # pyEELSMODEL dependency
+            import pyEELSMODEL
+
+            pkg_dir = os.path.dirname(pyEELSMODEL.__file__)
+            candidates = [
+                os.path.join(pkg_dir, "element_info.hdf5"),
+                os.path.join(
+                    pkg_dir, "components", "CLedge", "element_info.hdf5"
+                ),
+            ]
+            choices = []
+            for path in candidates:
+                if not os.path.exists(path):
+                    continue
+                with h5py.File(path, "r") as fh:
+                    for element in sorted(fh.keys()):
+                        sub_edges = set(fh[element].keys())
+                        for shell in ("K", "L", "M", "N", "O"):
+                            if any(
+                                sub.startswith(shell) for sub in sub_edges
+                            ):
+                                choices.append(f"{element}_{shell}")
+                break
+            _EDGE_CHOICES = choices or list(_FALLBACK_EDGE_CHOICES)
+        except Exception:
+            _EDGE_CHOICES = list(_FALLBACK_EDGE_CHOICES)
+    return list(_EDGE_CHOICES)
+
 
 def cupy_gpu_available() -> bool:
     """Return True if a usable CUDA device is available via CuPy (cached)."""
@@ -112,7 +161,8 @@ class EmlEngine:
         tol: float = 1e-8,
         error_skip_step: int = 100,
         decomposition_method: str = "default_decomposition",
-        regularization: float | None = None,
+        regularization_tv: float | None = None,
+        regularization_sr: float | None = None,
         fixed_weights: Sequence[Tuple[str, int, str]] | None = None,
     ) -> None:
         """Run the decomposition, optionally interpolating a W init.
@@ -120,9 +170,11 @@ class EmlEngine:
         *use_cupy* selects the backend (None auto-detects a CUDA device).
         *decomposition_method* is any method of the EELSNMF object (e.g.
         "default_decomposition", "default_kl_decomposition",
-        "alternate_decomposition", "SumRule_decomposition",
-        "EdgeTV_decomposition", "combinedTVSR_decomposition"). *regularization*
-        is the lambda passed to the methods that use one (ignored otherwise).
+        "SumRule_decomposition", "EdgeTV_decomposition",
+        "combinedTVSR_decomposition"). *regularization_tv* is the
+        Total-Variation lambda (EdgeTV, combinedTVSR) and
+        *regularization_sr* the SumRule lambda (SumRule, combinedTVSR);
+        each method receives exactly the lambdas it accepts.
         *fixed_weights* is a sequence of (edge, component, mode) triples
         constraining the decomposition: mode "fixed" freezes the edge's
         cross-section weight in the given component at its initial value;
@@ -147,12 +199,17 @@ class EmlEngine:
                     "for this run"
                 )
 
-        if regularization is not None:
-            if decomposition_method == "SumRule_decomposition" or decomposition_method == "EdgeTV_decomposition":
-                kwargs["lmbda"] = regularization
-            elif decomposition_method == "combinedTVSR_decomposition":
-                kwargs["TV_lmbda"] = regularization
-                kwargs["SR_lmbda"] = regularization
+        if decomposition_method == "SumRule_decomposition":
+            if regularization_sr is not None:
+                kwargs["lmbda"] = regularization_sr
+        elif decomposition_method == "EdgeTV_decomposition":
+            if regularization_tv is not None:
+                kwargs["lmbda"] = regularization_tv
+        elif decomposition_method == "combinedTVSR_decomposition":
+            if regularization_tv is not None:
+                kwargs["TV_lmbda"] = regularization_tv
+            if regularization_sr is not None:
+                kwargs["SR_lmbda"] = regularization_sr
 
         if fixed_weights:
             # Freeze the pinned W entries at their initial value: compute the
