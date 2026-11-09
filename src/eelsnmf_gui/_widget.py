@@ -3,10 +3,12 @@ This module contains Qt widgets for EELS spectroscopy processing and analysis.
 """
 
 import logging
+import math
 import os
 import pickle
 import sys
 from functools import partial
+from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,26 +20,26 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
-    QListView,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSlider,
     QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
     QToolTip,
-    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -66,7 +68,7 @@ from ._file_dialog import (
 from ._labels import (
     split_common_label_parts,
 )
-from ._nmf import cupy_gpu_available
+from ._nmf import available_core_loss_edges, cupy_gpu_available
 from ._plotting import plot_energy_ranges
 from ._preprocess import load_eml_folders
 from .session import BeamParams, MaskParams, Session
@@ -81,17 +83,45 @@ DEFAULT_EDGE_RANGES = {
 DECOMPOSITION_METHODS = (
     "default_decomposition",
     "default_kl_decomposition",
-    "alternate_decomposition",
     "SumRule_decomposition",
     "EdgeTV_decomposition",
     "combinedTVSR_decomposition",
 )
-# Methods accepting a regularization lambda.
-REGULARIZED_METHODS = {
+# Methods accepting a SumRule regularization lambda.
+SR_REGULARIZED_METHODS = {
     "SumRule_decomposition",
+    "combinedTVSR_decomposition",
+}
+# Methods accepting a Total-Variation regularization lambda.
+TV_REGULARIZED_METHODS = {
     "EdgeTV_decomposition",
     "combinedTVSR_decomposition",
 }
+
+# Maximum number of NMF components selectable in the GUI.
+MAX_COMPONENTS = 8
+# Component color boxes are laid out this many per row.
+COLORS_PER_ROW = 4
+
+# Section titles (QGroupBox) are written in bold. The group font is
+# bolded (the title is drawn with it); direct children are forced back
+# to the normal weight so the controls stay regular.
+GROUP_TITLE_STYLESHEET = (
+    "QGroupBox { font-weight: bold; }\n"
+    "QGroupBox > QWidget { font-weight: normal; }"
+)
+
+# Default component colors.
+DEFAULT_COLORS = [
+    np.array([1.0, 0.0, 0.0]),  # Red
+    np.array([0.0, 1.0, 0.0]),  # Green
+    np.array([0.0, 0.0, 1.0]),  # Blue
+    np.array([1.0, 0.5, 0.0]),  # Orange
+    np.array([0.5, 0.0, 1.0]),  # Purple
+    np.array([0.0, 1.0, 1.0]),  # Cyan
+    np.array([1.0, 0.0, 1.0]),  # Magenta
+    np.array([1.0, 1.0, 0.0]),  # Yellow
+]
 
 
 class _ProcessingWorker(QObject):
@@ -118,6 +148,73 @@ class NoWheelSpinBox(QSpinBox):
 class NoWheelDoubleSpinBox(QDoubleSpinBox):
     def wheelEvent(self, event):
         event.ignore()
+
+
+class NoWheelSlider(QSlider):
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class MappedSlider(QWidget):
+    """Horizontal slider whose positions map to values through callables.
+
+    Used for parameters with a nonlinear progression (e.g. a logarithmic
+    convergence tolerance): ``to_value`` converts a slider fraction in
+    [0, 1] into a parameter value, ``to_position`` is its inverse. The
+    current value is always readable on the label next to the slider.
+    """
+
+    valueChanged = Signal(float)
+
+    def __init__(
+        self,
+        minimum: float,
+        maximum: float,
+        to_value,
+        to_position,
+        n_positions: int = 1000,
+        fmt=str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._minimum = float(minimum)
+        self._maximum = float(maximum)
+        self._to_value = to_value
+        self._to_position = to_position
+        self._n_positions = int(n_positions)
+        self._fmt = fmt
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.slider = NoWheelSlider(Qt.Horizontal)
+        self.slider.setRange(0, self._n_positions)
+        self.label = QLabel()
+        self.label.setMinimumWidth(56)
+        layout.addWidget(self.slider, stretch=1)
+        layout.addWidget(self.label)
+        self.slider.valueChanged.connect(self._on_slider_changed)
+
+    def _on_slider_changed(self, _pos):
+        self._refresh_label()
+        self.valueChanged.emit(self.value())
+
+    def _refresh_label(self):
+        self.label.setText(self._fmt(self.value()))
+
+    def value(self) -> float:
+        fraction = self.slider.value() / self._n_positions
+        return self._to_value(fraction)
+
+    def setValue(self, value, emit: bool = False):
+        value = min(max(float(value), self._minimum), self._maximum)
+        position = round(self._to_position(value) * self._n_positions)
+        if emit:
+            self.slider.setValue(position)
+            return
+        self.slider.blockSignals(True)
+        self.slider.setValue(position)
+        self.slider.blockSignals(False)
+        self._refresh_label()
 
 
 class HelpButton(QToolButton):
@@ -235,20 +332,15 @@ class EELSProcessingWidget(QWidget):
         self.tol = 1e-8
         self.error_skip_step = 100
         self.decomposition_method = "default_decomposition"
-        self.regularization = 0.1
+        self.regularization_tv = 0.1
+        self.regularization_sr = 0.1
         self.n_power_laws = 50
         self.mask_enabled = False
         self.mask_dilation_iters = 1
-        self.colors = [
-            np.array([1.0, 0.0, 0.0]),  # Red
-            np.array([0.0, 1.0, 0.0]),  # Green
-            np.array([0.0, 0.0, 1.0]),  # Blue
-            np.array([1.0, 0.5, 0.0]),  # Orange
-        ]
+        self.colors = [c.copy() for c in DEFAULT_COLORS]
         self.source_folder = None
         self.source_folders = []
         self.results_folder = None
-        self.save_results = False
         self.save_deco = True  # deco objects are the default saved output
         self.save_pickle = False
         self.save_colored_images = False
@@ -451,9 +543,9 @@ class EELSProcessingWidget(QWidget):
         structure_group = QGroupBox("Fine Structure Definition")
         structure_layout = QVBoxLayout()
 
-        self.ranges_table = QTableWidget(0, 4)
+        self.ranges_table = QTableWidget(0, 5)
         self.ranges_table.setHorizontalHeaderLabels(
-            ["Use", "Name", "Min (eV)", "Max (eV)"]
+            ["Use", "Element", "Edge", "Min (eV)", "Max (eV)"]
         )
         self.ranges_table.verticalHeader().setVisible(False)
         self.ranges_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -463,11 +555,12 @@ class EELSProcessingWidget(QWidget):
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self._populate_ranges_table(self._saved_ranges)
         structure_layout.addWidget(self.ranges_table)
 
         ranges_buttons_layout = QHBoxLayout()
-        self.add_range_button = QPushButton("Add range")
+        self.add_range_button = QPushButton("Add edge")
         self.add_range_button.clicked.connect(self._add_range_dialog)
         ranges_buttons_layout.addWidget(self.add_range_button)
         self.remove_range_button = QPushButton("Remove selected")
@@ -486,21 +579,27 @@ class EELSProcessingWidget(QWidget):
         # Number of power-law backgrounds in the spectral model (G)
         power_laws_layout = QHBoxLayout()
         power_laws_layout.addWidget(QLabel("Number of power laws:"))
-        self.power_laws_spinbox = NoWheelSpinBox()
-        self.power_laws_spinbox.setRange(1, 500)
-        self.power_laws_spinbox.setValue(self.n_power_laws)
-        self.power_laws_spinbox.setSingleStep(5)
-        self.power_laws_spinbox.valueChanged.connect(
+        # Quadratic progression: fine control at small counts, quick access
+        # to the large ones.
+        self.power_laws_slider = MappedSlider(
+            1,
+            500,
+            to_value=lambda frac: round(1 + 499 * frac * frac),
+            to_position=lambda v: ((v - 1) / 499) ** 0.5,
+            n_positions=1000,
+            fmt=lambda v: str(int(round(v))),
+        )
+        self.power_laws_slider.setValue(self.n_power_laws)
+        self.power_laws_slider.valueChanged.connect(
             self._on_n_power_laws_changed
         )
-        power_laws_layout.addWidget(self.power_laws_spinbox)
+        power_laws_layout.addWidget(self.power_laws_slider, stretch=1)
         power_laws_layout.addWidget(
             self._make_help_button(
                 "Number of power-law backgrounds used to fit the "
                 "background signal (exponents spanning 0.5-8)."
             )
         )
-        power_laws_layout.addStretch()
         structure_layout.addLayout(power_laws_layout)
 
         # Fixed weights: pin an element's cross-section weight to a component
@@ -566,7 +665,7 @@ class EELSProcessingWidget(QWidget):
         structure_group.setLayout(structure_layout)
         left_column_layout.addWidget(structure_group)
 
-        # Visual Sanity Check Section
+        # Visual Sanity Check Section: only needs the loaded data.
         sanity_group = QGroupBox("Visual Sanity Check")
         sanity_layout = QVBoxLayout()
         self.sanity_button = QPushButton("Plot energy ranges")
@@ -578,40 +677,9 @@ class EELSProcessingWidget(QWidget):
         )
         sanity_layout.addWidget(self.variance_button)
 
-        model_layout = QHBoxLayout()
-        model_layout.addWidget(QLabel("Model:"))
-        self.model_combo = QComboBox()
-        self.model_combo.addItem("None (run processing first)", None)
-        model_layout.addWidget(self.model_combo, stretch=1)
-        sanity_layout.addLayout(model_layout)
-
-        model_buttons = QGridLayout()
-        self.plot_factors_button = QPushButton("Factors")
-        self.plot_factors_button.clicked.connect(
-            lambda: self._plot_from_model("plot_factors")
-        )
-        self.plot_edges_button = QPushButton("Edges")
-        self.plot_edges_button.clicked.connect(
-            lambda: self._plot_from_model("plot_edges")
-        )
-        self.plot_average_model_button = QPushButton("Average model")
-        self.plot_average_model_button.clicked.connect(
-            lambda: self._plot_from_model("plot_average_model")
-        )
-        self.plot_model_energy_ranges_button = QPushButton(
-            "Model energy ranges"
-        )
-        self.plot_model_energy_ranges_button.clicked.connect(
-            lambda: self._plot_from_model("plot_energy_ranges")
-        )
-        model_buttons.addWidget(self.plot_factors_button, 0, 0)
-        model_buttons.addWidget(self.plot_edges_button, 0, 1)
-        model_buttons.addWidget(self.plot_average_model_button, 1, 0)
-        model_buttons.addWidget(self.plot_model_energy_ranges_button, 1, 1)
-        sanity_layout.addLayout(model_buttons)
-
         sanity_group.setLayout(sanity_layout)
         left_column_layout.addWidget(sanity_group)
+        self.sanity_group = sanity_group
 
         # Processing Parameters Section
         processing_group = QGroupBox("Processing Parameters")
@@ -635,16 +703,20 @@ class EELSProcessingWidget(QWidget):
         )
         processing_layout.addLayout(iter_layout)
 
-        # Convergence tolerance
+        # Convergence tolerance (logarithmic slider: 0.01 decades per step)
         tol_layout = QHBoxLayout()
         tol_layout.addWidget(QLabel("Convergence tolerance:"))
-        self.tol_spinbox = NoWheelDoubleSpinBox()
-        self.tol_spinbox.setRange(1e-12, 1.0)
-        self.tol_spinbox.setDecimals(12)
-        self.tol_spinbox.setSingleStep(1e-8)
-        self.tol_spinbox.setValue(self.tol)
-        self.tol_spinbox.valueChanged.connect(self._on_tol_changed)
-        tol_layout.addWidget(self.tol_spinbox)
+        self.tol_slider = MappedSlider(
+            1e-12,
+            1.0,
+            to_value=lambda frac: 10.0 ** (-12 * frac),
+            to_position=lambda v: -math.log10(v) / 12.0,
+            n_positions=1200,
+            fmt=lambda v: f"{v:.2e}",
+        )
+        self.tol_slider.setValue(self.tol)
+        self.tol_slider.valueChanged.connect(self._on_tol_changed)
+        tol_layout.addWidget(self.tol_slider, stretch=1)
         tol_layout.addWidget(
             self._make_help_button(
                 "Convergence tolerance of the NMF: the decomposition "
@@ -689,30 +761,44 @@ class EELSProcessingWidget(QWidget):
         method_layout.addWidget(
             self._make_help_button(
                 "Algorithm used for the decomposition.\n"
-                "\tdefault: standard NMF; default_kl: KL divergence; \n"
-                "\talternate: alternating background/ELNES updates; \n"
-                "\tSumRule / EdgeTV / combinedTVSR: regularized variants"
-                "(these use the lambda parameter)."
+                "\tdefault: standard NMF; default_kl: KL divergence;\n"
+                "\tSumRule / EdgeTV / combinedTVSR: regularized variants\n"
+                "\t(these use the SR \u03bb and/or TV \u03bb parameters)."
             )
         )
         processing_layout.addLayout(method_layout)
 
         reg_layout = QHBoxLayout()
-        reg_layout.addWidget(QLabel("Regularization \u03bb:"))
-        self.regularization_spinbox = NoWheelDoubleSpinBox()
-        self.regularization_spinbox.setRange(0.0, 1000.0)
-        self.regularization_spinbox.setDecimals(4)
-        self.regularization_spinbox.setSingleStep(0.01)
-        self.regularization_spinbox.setValue(self.regularization)
-        self.regularization_spinbox.valueChanged.connect(
-            self._on_regularization_changed
+        reg_layout.addWidget(QLabel("TV \u03bb:"))
+        self.regularization_tv_spinbox = NoWheelDoubleSpinBox()
+        self.regularization_tv_spinbox.setRange(0.0, 1000.0)
+        self.regularization_tv_spinbox.setDecimals(4)
+        self.regularization_tv_spinbox.setSingleStep(0.01)
+        self.regularization_tv_spinbox.setValue(self.regularization_tv)
+        self.regularization_tv_spinbox.valueChanged.connect(
+            self._on_regularization_tv_changed
         )
-        reg_layout.addWidget(self.regularization_spinbox)
+        reg_layout.addWidget(self.regularization_tv_spinbox)
+
+        reg_layout.addWidget(QLabel("SR \u03bb:"))
+        self.regularization_sr_spinbox = NoWheelDoubleSpinBox()
+        self.regularization_sr_spinbox.setRange(0.0, 1000.0)
+        self.regularization_sr_spinbox.setDecimals(4)
+        self.regularization_sr_spinbox.setSingleStep(0.01)
+        self.regularization_sr_spinbox.setValue(self.regularization_sr)
+        self.regularization_sr_spinbox.valueChanged.connect(
+            self._on_regularization_sr_changed
+        )
+        reg_layout.addWidget(self.regularization_sr_spinbox)
+
         reg_layout.addWidget(
             self._make_help_button(
-                "Regularization lambda of the selected method "
-                "(SumRule, EdgeTV or combinedTVSR only).\n"
-                "Larger values enforce the constraint more strongly."
+                "Regularization lambdas of the selected method:\n"
+                "- SR \u03bb: sum-rule strength (SumRule, combinedTVSR).\n"
+                "- TV \u03bb: total-variation strength (EdgeTV, combinedTVSR).\n"
+                "Each method only uses the lambdas it accepts; the others "
+                "are greyed out. Larger values enforce the constraint "
+                "more strongly."
             )
         )
         reg_layout.addStretch()
@@ -722,7 +808,7 @@ class EELSProcessingWidget(QWidget):
         components_layout = QHBoxLayout()
         components_layout.addWidget(QLabel("Number of components:"))
         self.components_spinbox = NoWheelSpinBox()
-        self.components_spinbox.setRange(1, 4)
+        self.components_spinbox.setRange(1, MAX_COMPONENTS)
         self.components_spinbox.setValue(self.n_components)
         self.components_spinbox.valueChanged.connect(
             self._on_n_components_changed
@@ -774,7 +860,7 @@ class EELSProcessingWidget(QWidget):
         color_header_layout.addWidget(QLabel("Component Colors:"))
         color_layout.addLayout(color_header_layout)
 
-        self.color_buttons_layout = QHBoxLayout()
+        self.color_buttons_layout = QGridLayout()
         color_layout.addLayout(self.color_buttons_layout)
         self._rebuild_color_buttons()
 
@@ -802,16 +888,72 @@ class EELSProcessingWidget(QWidget):
         processing_group.setLayout(processing_layout)
         middle_column_layout.addWidget(processing_group)
 
-        # Save Options Section
-        save_group = QGroupBox("Saving parameters")
-        save_layout = QVBoxLayout()
+        # Run button and status
+        run_layout = QHBoxLayout()
+        self.run_button = QPushButton("Run Processing")
+        self.run_button.clicked.connect(self._run_processing)
+        run_layout.addWidget(self.run_button)
 
-        self.save_results_checkbox = QCheckBox("Save results")
-        self.save_results_checkbox.setChecked(self.save_results)
-        self.save_results_checkbox.stateChanged.connect(
-            self._sync_save_flags
+        self.status_label = QLabel("Ready")
+        run_layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        run_layout.addWidget(self.progress_bar)
+
+        middle_column_layout.addLayout(run_layout)
+
+        # Visualization of fitted results: everything here requires a
+        # decomposition to have been run (or a deco to be loaded).
+        viz_group = QGroupBox("Visualize processing results")
+        viz_layout = QVBoxLayout()
+
+        model_layout = QHBoxLayout()
+        model_layout.addWidget(QLabel("Model:"))
+        self.model_combo = QComboBox()
+        self.model_combo.addItem("None (run processing first)", None)
+        model_layout.addWidget(self.model_combo, stretch=1)
+        viz_layout.addLayout(model_layout)
+
+        model_buttons = QGridLayout()
+        self.plot_factors_button = QPushButton("Factors")
+        self.plot_factors_button.clicked.connect(
+            lambda: self._plot_from_model("plot_factors")
         )
-        save_layout.addWidget(self.save_results_checkbox)
+        self.plot_edges_button = QPushButton("Edges")
+        self.plot_edges_button.clicked.connect(
+            lambda: self._plot_from_model("plot_edges", normalize=True)
+        )
+        self.plot_loadings_button = QPushButton("Loadings")
+        self.plot_loadings_button.clicked.connect(
+            lambda: self._plot_from_model("plot_loadings")
+        )
+        self.plot_average_model_button = QPushButton("Average model")
+        self.plot_average_model_button.clicked.connect(
+            lambda: self._plot_from_model("plot_average_model")
+        )
+        self.plot_model_energy_ranges_button = QPushButton(
+            "Model energy ranges"
+        )
+        self.plot_model_energy_ranges_button.clicked.connect(
+            lambda: self._plot_from_model("plot_energy_ranges")
+        )
+        model_buttons.addWidget(self.plot_factors_button, 0, 0)
+        model_buttons.addWidget(self.plot_edges_button, 0, 1)
+        model_buttons.addWidget(self.plot_loadings_button, 1, 0)
+        model_buttons.addWidget(self.plot_average_model_button, 1, 1)
+        model_buttons.addWidget(self.plot_model_energy_ranges_button, 2, 0)
+        viz_layout.addLayout(model_buttons)
+
+        viz_group.setLayout(viz_layout)
+        middle_column_layout.addWidget(viz_group)
+        self.viz_group = viz_group
+
+        # Export Options Section: outputs are produced on demand from the
+        # decos kept in memory after a run (or from a loaded deco).
+        save_group = QGroupBox("Export")
+        save_layout = QVBoxLayout()
 
         self.save_deco_checkbox = QCheckBox("Deco objects (EELSNMF)")
         self.save_deco_checkbox.setToolTip(
@@ -859,11 +1001,6 @@ class EELSProcessingWidget(QWidget):
         self.save_excel_checkbox.stateChanged.connect(self._sync_save_flags)
         save_layout.addWidget(self.save_excel_checkbox)
 
-        self.export_loaded_button = QPushButton("Export loaded deco results")
-        self.export_loaded_button.clicked.connect(self._export_loaded_deco)
-        self.export_loaded_button.setEnabled(False)
-        save_layout.addWidget(self.export_loaded_button)
-
         results_folder_layout = QHBoxLayout()
         self.results_label = QLabel("No folder selected")
         self.results_button = QPushButton("Browse...")
@@ -871,26 +1008,27 @@ class EELSProcessingWidget(QWidget):
         results_folder_layout.addWidget(self.results_label)
         results_folder_layout.addWidget(self.results_button)
         save_layout.addLayout(results_folder_layout)
+
+        # The export action sits below the results folder: the natural flow
+        # is to choose the output folder, then export.
+        self.export_button = QPushButton("Export results")
+        self.export_button.clicked.connect(self._export_results)
+        self.export_button.setEnabled(False)
+        save_layout.addWidget(self.export_button)
+
         save_group.setLayout(save_layout)
         middle_column_layout.addWidget(save_group)
+        self.save_group = save_group
+        if not self.pre_mode:
+            # Masks only exist when this GUI performs the preprocessing.
+            self.save_masks_checkbox.setVisible(False)
         self._update_save_options_availability()
 
-        # Run button and status
-        run_layout = QHBoxLayout()
-        self.run_button = QPushButton("Run Processing")
-        self.run_button.clicked.connect(self._run_processing)
-        run_layout.addWidget(self.run_button)
+        left_column_layout.addStretch()
+        middle_column_layout.addStretch()
 
-        self.status_label = QLabel("Ready")
-        run_layout.addWidget(self.status_label)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(False)
-        run_layout.addWidget(self.progress_bar)
-
-        middle_column_layout.addLayout(run_layout)
-
+        # Reset row sits at the bottom of the middle column, just above
+        # the "Save/Load window state" line.
         reset_layout = QHBoxLayout()
         reset_layout.addStretch()
         self.reset_button = QPushButton("Reset all params to Defaults")
@@ -898,14 +1036,18 @@ class EELSProcessingWidget(QWidget):
         reset_layout.addWidget(self.reset_button)
         middle_column_layout.addLayout(reset_layout)
 
-        left_column_layout.addStretch()
-        middle_column_layout.addStretch()
-
-        # Log toggle at the bottom of the middle column: the stretch above
-        # pushes it past the filler, flush with the bottom rim of the window.
+        # Bottom row of the middle column: session configuration on the
+        # left, the log toggle on the right; the stretch above pushes the
+        # row past the filler, flush with the bottom rim of the window.
+        self.save_config_button = QPushButton("Save window state")
+        self.save_config_button.clicked.connect(self._save_config_dialog)
+        self.load_config_button = QPushButton("Load window state")
+        self.load_config_button.clicked.connect(self._load_config_dialog)
         self.log_toggle_button = QPushButton("Hide log")
         self.log_toggle_button.clicked.connect(self._toggle_log)
         toggle_row = QHBoxLayout()
+        toggle_row.addWidget(self.save_config_button)
+        toggle_row.addWidget(self.load_config_button)
         toggle_row.addStretch()
         toggle_row.addWidget(self.log_toggle_button)
         middle_column_layout.addLayout(toggle_row)
@@ -937,6 +1079,20 @@ class EELSProcessingWidget(QWidget):
         log_group.setLayout(log_layout)
         log_group.setMinimumWidth(360)
         self.log_group = log_group
+
+        # Section titles stand out in bold.
+        for group in (
+            input_group,
+            preprocessing_group,
+            microscope_group,
+            structure_group,
+            sanity_group,
+            processing_group,
+            viz_group,
+            save_group,
+            log_group,
+        ):
+            group.setStyleSheet(GROUP_TITLE_STYLESHEET)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(content_panel)
@@ -1022,29 +1178,15 @@ class EELSProcessingWidget(QWidget):
                 else os.path.dirname(self.source_folders[0])
             )
         )
-        if sys.platform.startswith("linux"):
-            dlg = MultiFolderDialog(
-                self,
-                "Select Source Folder(s) or a deco file",
-                start_dir=start_dir,
-            )
-            paths = dlg.selected_paths() if dlg.exec_() else []
-        else:
-            dlg = QFileDialog(self, "Select Source Folder(s)")
-            if start_dir:
-                dlg.setDirectory(start_dir)
-            dlg.setFileMode(QFileDialog.Directory)
-            dlg.setOption(QFileDialog.ShowDirsOnly, True)
-            dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-
-            list_view = dlg.findChild(QListView)
-            if list_view is not None:
-                list_view.setSelectionMode(QAbstractItemView.MultiSelection)
-            tree_view = dlg.findChild(QTreeView)
-            if tree_view is not None:
-                tree_view.setSelectionMode(QAbstractItemView.MultiSelection)
-
-            paths = dlg.selectedFiles() if dlg.exec_() else []
+        # The custom dialog is used on every platform: the stock
+        # QFileDialog cannot multi-select folders and mis-reports the
+        # selection on some systems (observed on macOS).
+        dlg = MultiFolderDialog(
+            self,
+            "Select Source Folder(s) or a deco file",
+            start_dir=start_dir,
+        )
+        paths = dlg.selected_paths() if dlg.exec_() else []
 
         if not paths:
             return
@@ -1150,7 +1292,7 @@ class EELSProcessingWidget(QWidget):
         set_value(
             "tol",
             lambda: deco.tol,
-            lambda v: self.tol_spinbox.setValue(float(v)),
+            lambda v: self.tol_slider.setValue(float(v), emit=True),
             "",
         )
         set_value(
@@ -1179,16 +1321,31 @@ class EELSProcessingWidget(QWidget):
 
         try:
             params = deco.analysis_description["decomposition"]["params"]
-            lam = params.get("lmbda", params.get("TV_lmbda"))
+            lam = params.get("lmbda")
             if lam is not None:
-                self.regularization_spinbox.setValue(float(lam))
-                restored.append(f"regularization = {lam}")
+                # A single lambda belongs to the method's only parameter.
+                if self.decomposition_method == "EdgeTV_decomposition":
+                    self.regularization_tv_spinbox.setValue(float(lam))
+                    restored.append(f"TV lambda = {lam}")
+                else:
+                    self.regularization_sr_spinbox.setValue(float(lam))
+                    restored.append(f"SR lambda = {lam}")
+            tv_lmbda = params.get("TV_lmbda")
+            if tv_lmbda is not None:
+                self.regularization_tv_spinbox.setValue(float(tv_lmbda))
+                restored.append(f"TV lambda = {tv_lmbda}")
+            sr_lmbda = params.get("SR_lmbda")
+            if sr_lmbda is not None:
+                self.regularization_sr_spinbox.setValue(float(sr_lmbda))
+                restored.append(f"SR lambda = {sr_lmbda}")
+            if lam is None and tv_lmbda is None and sr_lmbda is None:
+                missing.append("regularization")
         except (AttributeError, KeyError, TypeError):
             missing.append("regularization")
 
         try:
             backgrounds = deco.model.backgrounds
-            self.power_laws_spinbox.setValue(int(len(backgrounds)))
+            self.power_laws_slider.setValue(int(len(backgrounds)), emit=True)
             restored.append("n_power_laws")
         except (AttributeError, TypeError):
             missing.append("n_power_laws")
@@ -1249,6 +1406,7 @@ class EELSProcessingWidget(QWidget):
         self.model_combo.clear()
         self.model_combo.addItem("None (run processing first)", None)
         self.model_combo.blockSignals(False)
+        self._update_save_options_availability()
 
     def _set_status(self, message: str, *, exc_info=False):
         """Update the status label; error messages are mirrored to the log."""
@@ -1314,15 +1472,16 @@ class EELSProcessingWidget(QWidget):
         for name, deco in entries:
             self.model_combo.addItem(name, deco)
         self.model_combo.blockSignals(False)
+        self._update_save_options_availability()
 
-    def _plot_from_model(self, method_name: str):
+    def _plot_from_model(self, method_name: str, **kwargs):
         """Run an EELSNMF plot method on the model selected in the combo."""
         deco = self.model_combo.currentData()
         if deco is None:
             self._set_status("Error: Run processing first")
             return
         try:
-            getattr(deco, method_name)()
+            getattr(deco, method_name)(**kwargs)
             plt.show(block=False)
         except Exception as exc:  # pragma: no cover - UI error path
             self._set_status(f"Error: {exc}", exc_info=True)
@@ -1383,22 +1542,33 @@ class EELSProcessingWidget(QWidget):
         self.decomposition_method = method_name
         self._update_regularization_availability()
 
-    def _on_regularization_changed(self, value):
-        """Update regularization lambda parameter."""
-        self.regularization = float(value)
+    def _on_regularization_tv_changed(self, value):
+        """Update the Total-Variation regularization lambda parameter."""
+        self.regularization_tv = float(value)
+
+    def _on_regularization_sr_changed(self, value):
+        """Update the SumRule regularization lambda parameter."""
+        self.regularization_sr = float(value)
 
     def _update_regularization_availability(self):
-        """Grey out the lambda spinbox for methods without regularization."""
-        enabled = self.decomposition_method in REGULARIZED_METHODS
-        self.regularization_spinbox.setEnabled(enabled)
-        if enabled:
-            self.regularization_spinbox.setToolTip(
-                "Regularization lambda of the selected method"
+        """Grey out each lambda spinbox for methods that do not use it."""
+        tv_enabled = self.decomposition_method in TV_REGULARIZED_METHODS
+        sr_enabled = self.decomposition_method in SR_REGULARIZED_METHODS
+        self.regularization_tv_spinbox.setEnabled(tv_enabled)
+        self.regularization_sr_spinbox.setEnabled(sr_enabled)
+        if tv_enabled and sr_enabled:
+            tooltip = (
+                "Regularization lambdas of the selected method\n"
+                "(SR \u03bb: sum rule, TV \u03bb: total variation)"
             )
+        elif tv_enabled:
+            tooltip = "Total-variation regularization lambda of the selected method"
+        elif sr_enabled:
+            tooltip = "Sum-rule regularization lambda of the selected method"
         else:
-            self.regularization_spinbox.setToolTip(
-                "The selected decomposition method has no regularization"
-            )
+            tooltip = "The selected decomposition method has no regularization"
+        self.regularization_tv_spinbox.setToolTip(tooltip)
+        self.regularization_sr_spinbox.setToolTip(tooltip)
 
     def _on_n_power_laws_changed(self, value):
         """Update the number of power-law backgrounds in G."""
@@ -1486,15 +1656,23 @@ class EELSProcessingWidget(QWidget):
 
     def _decomposition_settings(self) -> dict:
         """Current decomposition parameters, as passed to Session.run."""
-        regularization = self.regularization
-        if self.decomposition_method not in REGULARIZED_METHODS:
-            regularization = None
+        regularization_tv = (
+            self.regularization_tv
+            if self.decomposition_method in TV_REGULARIZED_METHODS
+            else None
+        )
+        regularization_sr = (
+            self.regularization_sr
+            if self.decomposition_method in SR_REGULARIZED_METHODS
+            else None
+        )
         return {
             "n_power_laws": self.n_power_laws,
             "tol": self.tol,
             "error_skip_step": self.error_skip_step,
             "decomposition_method": self.decomposition_method,
-            "regularization": regularization,
+            "regularization_tv": regularization_tv,
+            "regularization_sr": regularization_sr,
         }
 
     def _on_median_filter_size_changed(self, value):
@@ -1577,26 +1755,14 @@ class EELSProcessingWidget(QWidget):
             self._update_save_options_availability()
 
     def _update_save_options_availability(self):
-        enabled = self.save_results
-        self.results_label.setEnabled(enabled)
-        self.results_button.setEnabled(enabled)
-        for checkbox in (
-            self.save_deco_checkbox,
-            self.save_pickle_checkbox,
-            self.save_colored_checkbox,
-            self.save_masks_checkbox,
-            self.save_original_checkbox,
-            self.save_summary_checkbox,
-            self.save_excel_checkbox,
-        ):
-            checkbox.setEnabled(enabled)
-        self.export_loaded_button.setEnabled(
-            enabled and self._loaded_deco is not None
+        """The export button works once a run result or a deco is in memory."""
+        has_something_to_export = (
+            self._loaded_deco is not None or self._last_results is not None
         )
+        self.export_button.setEnabled(has_something_to_export)
 
     def _sync_save_flags(self, _value=None):
-        """Read all saving checkboxes into the corresponding flags."""
-        self.save_results = self.save_results_checkbox.isChecked()
+        """Read all export checkboxes into the corresponding flags."""
         self.save_deco = self.save_deco_checkbox.isChecked()
         self.save_pickle = self.save_pickle_checkbox.isChecked()
         self.save_colored_images = self.save_colored_checkbox.isChecked()
@@ -1604,7 +1770,6 @@ class EELSProcessingWidget(QWidget):
         self.save_original_images = self.save_original_checkbox.isChecked()
         self.save_summary_plot = self.save_summary_checkbox.isChecked()
         self.save_excel = self.save_excel_checkbox.isChecked()
-        self._update_save_options_availability()
 
     def _on_processing_mode_changed(self, value):
         self.process_individual = self.process_individual_checkbox.isChecked()
@@ -1632,15 +1797,9 @@ class EELSProcessingWidget(QWidget):
 
     def _ensure_color_count(self):
         if len(self.colors) < self.n_components:
-            default_palette = [
-                np.array([1.0, 0.0, 0.0]),
-                np.array([0.0, 1.0, 0.0]),
-                np.array([0.0, 0.0, 1.0]),
-                np.array([1.0, 0.5, 0.0]),
-            ]
             while len(self.colors) < self.n_components:
                 self.colors.append(
-                    default_palette[len(self.colors) % len(default_palette)]
+                    DEFAULT_COLORS[len(self.colors) % len(DEFAULT_COLORS)]
                 )
         elif len(self.colors) > self.n_components:
             self.colors = self.colors[: self.n_components]
@@ -1658,7 +1817,9 @@ class EELSProcessingWidget(QWidget):
             button = QPushButton(f"{idx + 1}")
             self._update_color_button(button, self.colors[idx])
             button.clicked.connect(lambda _, i=idx: self._pick_color(i))
-            self.color_buttons_layout.addWidget(button)
+            self.color_buttons_layout.addWidget(
+                button, idx // COLORS_PER_ROW, idx % COLORS_PER_ROW
+            )
             self.color_buttons.append(button)
 
     def _on_n_components_changed(self, value):
@@ -1688,6 +1849,55 @@ class EELSProcessingWidget(QWidget):
                 bool(entry.get("checked", False)),
             )
 
+    def _edge_choices(self):
+        """All 'Element_Shell' names the EELSNMF models can fit."""
+        return available_core_loss_edges()
+
+    @staticmethod
+    def _split_edge_name(name: str):
+        """Split 'Fe_L' into ('Fe', 'L'); names without '_' keep full."""
+        if "_" in name:
+            element, shell = name.split("_", 1)
+            return element, shell
+        return name, ""
+
+    def _known_elements(self):
+        return sorted({self._split_edge_name(c)[0] for c in self._edge_choices()})
+
+    def _known_shells(self, element: str):
+        """Shells (K, L, ...) with data for *element*, in spectral order."""
+        shells = {
+            self._split_edge_name(c)[1]
+            for c in self._edge_choices()
+            if self._split_edge_name(c)[0] == element
+        }
+        order = ["K", "L", "M", "N", "O"]
+        known = [s for s in order if s in shells]
+        # Keep any non-standard suffix (legacy names) at the end.
+        return known + sorted(shells.difference(order))
+
+    def _make_element_combo(self, element: str) -> QComboBox:
+        """Combobox restricted to the elements with cross-section data."""
+        combo = QComboBox()
+        elements = self._known_elements()
+        if element and element not in elements:
+            combo.addItem(element)
+        combo.addItems(elements)
+        index = combo.findText(element)
+        combo.setCurrentIndex(max(index, 0))
+        return combo
+
+    def _make_shell_combo(self, element: str, shell: str) -> QComboBox:
+        """Combobox of the shells available for *element*."""
+        combo = QComboBox()
+        shells = self._known_shells(element)
+        if shell and shell not in shells:
+            combo.addItem(shell)
+        combo.addItems(shells)
+        index = combo.findText(shell)
+        combo.setCurrentIndex(max(index, 0))
+        return combo
+
     def _add_range_row(self, name, min_val, max_val, checked=True):
         row = self.ranges_table.rowCount()
         self.ranges_table.insertRow(row)
@@ -1699,34 +1909,62 @@ class EELSProcessingWidget(QWidget):
         use_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
         self.ranges_table.setItem(row, 0, use_item)
 
-        name_item = QTableWidgetItem(str(name))
-        name_item.setFlags(
-            Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable
-        )
-        self.ranges_table.setItem(row, 1, name_item)
+        # Element and shell are restricted to the edges the EELSNMF
+        # cross-section models can actually fit; unknown (legacy) names
+        # are kept visible rather than silently substituted.
+        element, shell = self._split_edge_name(str(name))
+        element_combo = self._make_element_combo(element)
+        shell_combo = self._make_shell_combo(element, shell)
+
+        def refresh_shells(element_text, _combo=shell_combo, _shell=shell):
+            current = _combo.currentText() or _shell
+            fresh = self._make_shell_combo(element_text, current)
+            _combo.blockSignals(True)
+            _combo.clear()
+            for i in range(fresh.count()):
+                _combo.addItem(fresh.itemText(i))
+            _combo.setCurrentIndex(fresh.currentIndex())
+            _combo.blockSignals(False)
+
+        element_combo.currentTextChanged.connect(refresh_shells)
+        self.ranges_table.setCellWidget(row, 1, element_combo)
+        self.ranges_table.setCellWidget(row, 2, shell_combo)
 
         min_spin = NoWheelDoubleSpinBox()
         min_spin.setRange(0.0, 3000.0)
         min_spin.setSingleStep(1.0)
         min_spin.setValue(float(min_val))
-        self.ranges_table.setCellWidget(row, 2, min_spin)
+        self.ranges_table.setCellWidget(row, 3, min_spin)
 
         max_spin = NoWheelDoubleSpinBox()
         max_spin.setRange(0.0, 3000.0)
         max_spin.setSingleStep(1.0)
         max_spin.setValue(float(max_val))
-        self.ranges_table.setCellWidget(row, 3, max_spin)
+        self.ranges_table.setCellWidget(row, 4, max_spin)
+
+    def _row_edge_name(self, row: int) -> str:
+        """'Element_Shell' name of a range row (legacy rows may lack '_')."""
+        element_combo = self.ranges_table.cellWidget(row, 1)
+        shell_combo = self.ranges_table.cellWidget(row, 2)
+        if element_combo is None:
+            return ""
+        element = element_combo.currentText().strip()
+        shell = (
+            shell_combo.currentText().strip()
+            if shell_combo is not None
+            else ""
+        )
+        return f"{element}_{shell}" if shell else element
 
     def _get_ranges_list(self):
         ranges = []
         for row in range(self.ranges_table.rowCount()):
             use_item = self.ranges_table.item(row, 0)
-            name_item = self.ranges_table.item(row, 1)
-            min_spin = self.ranges_table.cellWidget(row, 2)
-            max_spin = self.ranges_table.cellWidget(row, 3)
+            min_spin = self.ranges_table.cellWidget(row, 3)
+            max_spin = self.ranges_table.cellWidget(row, 4)
             ranges.append(
                 {
-                    "name": name_item.text().strip() if name_item else "",
+                    "name": self._row_edge_name(row),
                     "min": (
                         float(min_spin.value())
                         if min_spin is not None
@@ -1769,50 +2007,81 @@ class EELSProcessingWidget(QWidget):
         return ranges
 
     def _add_range_dialog(self):
-        name, ok = QInputDialog.getText(self, "Add range", "Range name:")
-        if not ok:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add edge")
+        dialog_layout = QVBoxLayout(dialog)
+
+        element_layout = QHBoxLayout()
+        element_layout.addWidget(QLabel("Element:"))
+        element_combo = self._make_element_combo(
+            self._known_elements()[0] if self._known_elements() else ""
+        )
+        element_layout.addWidget(element_combo, stretch=1)
+        dialog_layout.addLayout(element_layout)
+
+        shell_layout = QHBoxLayout()
+        shell_layout.addWidget(QLabel("Edge:"))
+        shell_combo = QComboBox()
+
+        def refresh_shells(element_text):
+            current = shell_combo.currentText()
+            fresh = self._make_shell_combo(element_text, current)
+            shell_combo.blockSignals(True)
+            shell_combo.clear()
+            for i in range(fresh.count()):
+                shell_combo.addItem(fresh.itemText(i))
+            shell_combo.setCurrentIndex(fresh.currentIndex())
+            shell_combo.blockSignals(False)
+
+        element_combo.currentTextChanged.connect(refresh_shells)
+        refresh_shells(element_combo.currentText())
+        shell_layout.addWidget(shell_combo, stretch=1)
+        dialog_layout.addLayout(shell_layout)
+
+        min_layout = QHBoxLayout()
+        min_layout.addWidget(QLabel("Min (eV):"))
+        min_spin = NoWheelDoubleSpinBox()
+        min_spin.setRange(0.0, 3000.0)
+        min_layout.addWidget(min_spin)
+        dialog_layout.addLayout(min_layout)
+
+        max_layout = QHBoxLayout()
+        max_layout.addWidget(QLabel("Max (eV):"))
+        max_spin = NoWheelDoubleSpinBox()
+        max_spin.setRange(0.0, 3000.0)
+        max_spin.setValue(min_spin.value() + 1.0)
+        min_spin.valueChanged.connect(
+            lambda value: max_spin.setValue(max(max_spin.value(), value + 1.0))
+        )
+        max_layout.addWidget(max_spin)
+        dialog_layout.addLayout(max_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        dialog_layout.addWidget(buttons)
+
+        if not dialog.exec_():
             return
-        name = name.strip()
-        if not name:
-            QMessageBox.warning(
-                self, "Add range", "Range name cannot be empty."
-            )
-            return
+        element = element_combo.currentText().strip()
+        shell = shell_combo.currentText().strip()
+        name = f"{element}_{shell}" if shell else element
         existing_names = {r["name"] for r in self._get_ranges_list()}
         if name in existing_names:
             QMessageBox.warning(
                 self,
-                "Add range",
-                f"Range name '{name}' already exists.",
+                "Add edge",
+                f"Edge '{name}' already exists.",
             )
             return
-
-        min_val, ok = QInputDialog.getDouble(
-            self,
-            "Add range",
-            "Min (eV):",
-            0.0,
-            0.0,
-            3000.0,
-            1,
-        )
-        if not ok:
-            return
-        max_val, ok = QInputDialog.getDouble(
-            self,
-            "Add range",
-            "Max (eV):",
-            min_val + 1.0,
-            0.0,
-            3000.0,
-            1,
-        )
-        if not ok:
-            return
+        min_val = float(min_spin.value())
+        max_val = float(max_spin.value())
         if min_val >= max_val:
             QMessageBox.warning(
                 self,
-                "Add range",
+                "Add edge",
                 "Min must be less than Max.",
             )
             return
@@ -1872,17 +2141,12 @@ class EELSProcessingWidget(QWidget):
         self.tol = 1e-8
         self.error_skip_step = 100
         self.decomposition_method = "default_decomposition"
-        self.regularization = 0.1
+        self.regularization_tv = 0.1
+        self.regularization_sr = 0.1
         self.n_power_laws = 50
         self.mask_enabled = False
         self.mask_dilation_iters = 1
-        self.colors = [
-            np.array([1.0, 0.0, 0.0]),
-            np.array([0.0, 1.0, 0.0]),
-            np.array([0.0, 0.0, 1.0]),
-            np.array([1.0, 0.5, 0.0]),
-        ]
-        self.save_results = False
+        self.colors = [c.copy() for c in DEFAULT_COLORS]
         self.save_deco = True
         self.save_pickle = False
         self.save_colored_images = False
@@ -1900,11 +2164,12 @@ class EELSProcessingWidget(QWidget):
         self.alpha_spinbox.setValue(self.alpha)
         self.beta_spinbox.setValue(self.beta)
         self.iter_spinbox.setValue(self.max_iters)
-        self.tol_spinbox.setValue(self.tol)
+        self.tol_slider.setValue(self.tol)
         self.error_skip_spinbox.setValue(self.error_skip_step)
         self.method_combo.setCurrentText(self.decomposition_method)
-        self.regularization_spinbox.setValue(self.regularization)
-        self.power_laws_spinbox.setValue(self.n_power_laws)
+        self.regularization_tv_spinbox.setValue(self.regularization_tv)
+        self.regularization_sr_spinbox.setValue(self.regularization_sr)
+        self.power_laws_slider.setValue(self.n_power_laws)
         self.median_filter_spinbox.setValue(self.median_filter_size)
         index = self.despike_combo.findData(self.despike_method)
         self.despike_combo.setCurrentIndex(max(index, 0))
@@ -1924,7 +2189,6 @@ class EELSProcessingWidget(QWidget):
         self.process_joint_checkbox.setChecked(self.process_joint)
         self._update_processing_mode_availability()
 
-        self.save_results_checkbox.setChecked(self.save_results)
         self._update_save_options_availability()
 
         self._populate_ranges_table(self._default_ranges())
@@ -1933,6 +2197,135 @@ class EELSProcessingWidget(QWidget):
         self._rebuild_color_buttons()
         self._save_settings()
         self._set_status("Defaults restored")
+
+    # -- session configuration ------------------------------------------------
+
+    def _fixed_weight_rows(self):
+        """Constraint rows as [edge, component, state] lists (for saving)."""
+        rows = []
+        for row in range(self.fixed_weights_table.rowCount()):
+            edge_combo = self.fixed_weights_table.cellWidget(row, 0)
+            component_combo = self.fixed_weights_table.cellWidget(row, 1)
+            state_combo = self.fixed_weights_table.cellWidget(row, 2)
+            if None in (edge_combo, component_combo, state_combo):
+                continue
+            rows.append(
+                [
+                    edge_combo.currentText(),
+                    component_combo.currentIndex(),
+                    state_combo.currentText(),
+                ]
+            )
+        return rows
+
+    def _collect_config(self):
+        """Snapshot the current parameters into a SessionConfig."""
+        from ._config import SessionConfig
+
+        self._ensure_color_count()
+        return SessionConfig(
+            e0=self.e0,
+            alpha=self.alpha,
+            beta=self.beta,
+            edges=self._get_ranges_list(),
+            fixed_weights=self._fixed_weight_rows(),
+            n_components=self.n_components,
+            max_iters=self.max_iters,
+            tol=self.tol,
+            error_skip_step=self.error_skip_step,
+            decomposition_method=self.decomposition_method,
+            regularization_tv=self.regularization_tv,
+            regularization_sr=self.regularization_sr,
+            n_power_laws=self.n_power_laws,
+            colors=[color.tolist() for color in self.colors],
+        )
+
+    def _apply_config(self, config):
+        """Apply a SessionConfig to the widgets and parameters."""
+        self.e0 = config.e0
+        self.alpha = config.alpha
+        self.beta = config.beta
+        self.max_iters = config.max_iters
+        self.tol = config.tol
+        self.error_skip_step = config.error_skip_step
+        self.n_components = config.n_components
+        self.decomposition_method = config.decomposition_method
+        self.regularization_tv = config.regularization_tv
+        self.regularization_sr = config.regularization_sr
+        self.n_power_laws = config.n_power_laws
+
+        self.e0_spinbox.setValue(self.e0)
+        self.alpha_spinbox.setValue(self.alpha)
+        self.beta_spinbox.setValue(self.beta)
+        self.iter_spinbox.setValue(self.max_iters)
+        self.tol_slider.setValue(self.tol, emit=True)
+        self.error_skip_spinbox.setValue(self.error_skip_step)
+        self.method_combo.setCurrentText(self.decomposition_method)
+        self.regularization_tv_spinbox.setValue(self.regularization_tv)
+        self.regularization_sr_spinbox.setValue(self.regularization_sr)
+        self.power_laws_slider.setValue(self.n_power_laws, emit=True)
+
+        if config.edges:
+            self._populate_ranges_table(config.edges)
+        self.fixed_weights_table.setRowCount(0)
+        for edge, component, state in config.fixed_weights:
+            self._add_fixed_weight_row(
+                str(edge), int(component), str(state)
+            )
+
+        if config.colors:
+            colors = [
+                np.array([float(c) for c in color]) for color in config.colors
+            ]
+            self.colors = colors[: self.n_components]
+            self._ensure_color_count()
+        self.components_spinbox.setValue(self.n_components)
+        self._rebuild_color_buttons()
+
+    def _save_config_dialog(self):
+        """Save the current parameters to a JSON configuration file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save session configuration",
+            "session_config.json",
+            "Session configuration (*.json)",
+        )
+        if not path:
+            return
+        try:
+            self._collect_config().save(path)
+        except Exception as exc:
+            self._set_status(f"Error: {exc}", exc_info=True)
+            return
+        self._set_status(f"Configuration saved: {os.path.basename(path)}")
+
+    def _load_config_dialog(self):
+        """Load parameters from a JSON configuration file."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load session configuration",
+            "",
+            "Session configuration (*.json)",
+        )
+        if not path:
+            return
+        self._load_config_from(path)
+
+    def _load_config_from(self, path: str):
+        from ._config import SessionConfig
+
+        try:
+            config = SessionConfig.load(path)
+        except Exception as exc:
+            self._set_status(f"Error: {exc}", exc_info=True)
+            return
+        try:
+            self._apply_config(config)
+        except Exception as exc:
+            self._set_status(f"Error: {exc}", exc_info=True)
+            return
+        self._save_settings()
+        self._set_status(f"Configuration loaded: {os.path.basename(path)}")
 
     def _update_color_button(self, button, rgb_array):
         """Update button background to reflect chosen color."""
@@ -2085,10 +2478,6 @@ class EELSProcessingWidget(QWidget):
             self._set_status("Error: Select a processing mode")
             return
 
-        if self.save_results and self.results_folder is None:
-            self._set_status("Error: No results folder selected")
-            return
-
         self._set_status("Processing...")
 
         self._save_settings()
@@ -2112,10 +2501,14 @@ class EELSProcessingWidget(QWidget):
 
         if self.debug:
             self.progress_bar.setVisible(True)
-            results = self._session.run(**run_kwargs)
-            self._update_model_combo(results)
-            self._export_and_save_processing_results(results)
-            self.progress_bar.setVisible(False)
+            try:
+                results = self._session.run(**run_kwargs)
+                self._update_model_combo(results)
+                self._show_processing_results(results)
+            except Exception as exc:
+                self._set_status(f"Error: {exc}", exc_info=True)
+            finally:
+                self.progress_bar.setVisible(False)
         else:
             self._start_processing_on_thread(run_kwargs)
 
@@ -2161,9 +2554,29 @@ class EELSProcessingWidget(QWidget):
         )
         if saved_method in DECOMPOSITION_METHODS:
             self.decomposition_method = saved_method
-        self.regularization = settings.value(
-            "params/regularization", self.regularization, type=float
+        legacy_regularization = settings.value("params/regularization")
+        self.regularization_tv = settings.value(
+            "params/regularization_tv",
+            self.regularization_tv,
+            type=float,
         )
+        self.regularization_sr = settings.value(
+            "params/regularization_sr",
+            self.regularization_sr,
+            type=float,
+        )
+        if (
+            legacy_regularization is not None
+            and settings.contains("params/regularization_tv") is False
+            and settings.contains("params/regularization_sr") is False
+        ):
+            # Old settings only stored one lambda; seed both fields with it.
+            try:
+                legacy_value = float(legacy_regularization)
+                self.regularization_tv = legacy_value
+                self.regularization_sr = legacy_value
+            except (TypeError, ValueError):
+                pass
         self.n_power_laws = settings.value(
             "params/n_power_laws", self.n_power_laws, type=int
         )
@@ -2173,7 +2586,6 @@ class EELSProcessingWidget(QWidget):
             )
             if saved_despike in ("eml", "hampel"):
                 self.despike_method = saved_despike
-        self.save_results = False
         self.save_deco = settings.value(
             "saving/deco_objects", self.save_deco, type=bool
         )
@@ -2236,7 +2648,8 @@ class EELSProcessingWidget(QWidget):
         settings.setValue(
             "params/decomposition_method", self.decomposition_method
         )
-        settings.setValue("params/regularization", self.regularization)
+        settings.setValue("params/regularization_tv", self.regularization_tv)
+        settings.setValue("params/regularization_sr", self.regularization_sr)
         settings.setValue("params/n_power_laws", self.n_power_laws)
         settings.setValue(
             "params/colors", [color.tolist() for color in self.colors]
@@ -2250,21 +2663,7 @@ class EELSProcessingWidget(QWidget):
         settings.setValue("saving/edges_csv", self.save_excel)
 
         settings.setValue("edges/ranges", self._get_ranges_list())
-        fixed_rows = []
-        for row in range(self.fixed_weights_table.rowCount()):
-            edge_combo = self.fixed_weights_table.cellWidget(row, 0)
-            component_combo = self.fixed_weights_table.cellWidget(row, 1)
-            state_combo = self.fixed_weights_table.cellWidget(row, 2)
-            if None in (edge_combo, component_combo, state_combo):
-                continue
-            fixed_rows.append(
-                [
-                    edge_combo.currentText(),
-                    component_combo.currentIndex(),
-                    state_combo.currentText(),
-                ]
-            )
-        settings.setValue("edges/fixed_weights", fixed_rows)
+        settings.setValue("edges/fixed_weights", self._fixed_weight_rows())
 
     @staticmethod
     def _settings_color(value, fallback: np.ndarray) -> np.ndarray:
@@ -2331,14 +2730,18 @@ class EELSProcessingWidget(QWidget):
 
     def _on_processing_finished(self, results, error):
         print("[EELS] Processing thread finished")
-        if error is not None:
-            self._set_status(f"Error: {error}", exc_info=error)
+        try:
+            if error is not None:
+                self._set_status(f"Error: {error}", exc_info=error)
+                return
+            self._update_model_combo(results)
+            self._show_processing_results(results)
+        except Exception as exc:
+            # Never leave the run UI stuck: surface the failure and make
+            # sure the progress bar stops and the button is re-enabled.
+            self._set_status(f"Error: {exc}", exc_info=True)
+        finally:
             self._finish_processing_ui()
-            return
-
-        self._update_model_combo(results)
-        self._export_and_save_processing_results(results)
-        self._finish_processing_ui()
 
     def _finish_processing_ui(self):
         self.progress_bar.setVisible(False)
@@ -2425,22 +2828,37 @@ class EELSProcessingWidget(QWidget):
         self._save_deco_objects(results)
         self._save_full_pickle(results)
 
-    def _export_loaded_deco(self):
-        """Re-export the outputs of the loaded deco per the saving options."""
-        deco = self._loaded_deco
-        if deco is None:
-            self._set_status("Error: No deco loaded")
-            return
-        if not self.save_results or self.results_folder is None:
-            self._set_status("Error: No results folder selected")
+    def _export_results(self):
+        """Export the run results (or the loaded deco) per the checkboxes.
+
+        The decos of the last run stay in memory, so exporting can happen
+        at any time after processing without re-running it.
+        """
+        if self._loaded_deco is not None:
+            if not self.results_folder:
+                self._set_status("Error: No results folder selected")
+                return
+            try:
+                self._export_loaded_deco_impl(self._loaded_deco)
+            except Exception as exc:
+                self._set_status(f"Error: {exc}", exc_info=True)
+                return
+            self._set_status("Loaded deco exported")
             return
 
+        results = self._last_results
+        if results is None:
+            self._set_status("Error: Run processing first")
+            return
+        if not self.results_folder:
+            self._set_status("Error: No results folder selected")
+            return
         try:
-            self._export_loaded_deco_impl(deco)
+            self._export_run_results(results)
         except Exception as exc:
             self._set_status(f"Error: {exc}", exc_info=True)
             return
-        self._set_status("Loaded deco exported")
+        self._set_status("Results exported")
 
     def _export_loaded_deco_impl(self, deco):
         ranges = getattr(deco, "fine_structure_ranges", None)
@@ -2528,13 +2946,8 @@ class EELSProcessingWidget(QWidget):
             else:
                 plt.close(fig)
 
-    def _export_and_save_processing_results(self, results):
-        if self.save_results and self.results_folder is not None:
-            if self.save_deco:
-                self._save_deco_objects(results)
-            if self.save_pickle:
-                self._save_full_pickle(results)
-
+    def _collect_run_lists(self, results):
+        """Gather per-scope images, edges and summaries from a run."""
         labels_individual = results.labels
         labels_joint = results.labels_joint
 
@@ -2616,14 +3029,150 @@ class EELSProcessingWidget(QWidget):
             if len(individuals) == len(labels_base):
                 display_labels = individuals
 
+        return SimpleNamespace(
+            labels_individual=labels_individual,
+            labels_joint=labels_joint,
+            joint_pixel_scale=(
+                results.joint.pixel_scale if results.joint is not None else None
+            ),
+            list_imgs=list_imgs,
+            list_imgs_original=list_imgs_original,
+            list_masks=list_masks,
+            list_imgs_components=list_imgs_components,
+            list_edges=list_edges,
+            list_x_axis=list_x_axis,
+            list_pixel_scales=list_pixel_scales,
+            list_edge_summaries=list_edge_summaries,
+            edges_combined=edges_combined,
+            x_axis_combined=x_axis_combined,
+            list_imgs_joint=list_imgs_joint,
+            list_imgs_original_joint=list_imgs_original_joint,
+            list_imgs_components_joint=list_imgs_components_joint,
+            list_masks_joint=list_masks_joint,
+            summary_joint=summary_joint,
+            display_labels=display_labels,
+            suptitle=suptitle,
+        )
+
+    def _build_summary_figure(self, lists):
+        """Build the run's summary figure (None when not applicable)."""
+        use_joint_images = self.process_joint and bool(lists.list_imgs_joint)
+        plot_imgs = (
+            lists.list_imgs_joint if use_joint_images else lists.list_imgs
+        )
+        plot_imgs_original = (
+            lists.list_imgs_original_joint
+            if use_joint_images
+            else lists.list_imgs_original
+        )
+        plot_masks = (
+            lists.list_masks_joint
+            if use_joint_images
+            else lists.list_masks
+        )
+        plot_imgs_components = (
+            lists.list_imgs_components_joint
+            if use_joint_images
+            else lists.list_imgs_components
+        )
+        plot_pixel_scales = lists.list_pixel_scales
+        if (
+            use_joint_images
+            and not plot_pixel_scales
+            and lists.joint_pixel_scale is not None
+            and lists.display_labels
+        ):
+            # Joint runs carry a single pixel scale for all mapped images.
+            plot_pixel_scales = [lists.joint_pixel_scale] * len(
+                lists.display_labels
+            )
+
+        if self.process_individual and self.process_joint:
+            fig, _ = self._create_summary_plot(
+                plot_imgs,
+                plot_imgs_original,
+                plot_masks,
+                plot_imgs_components,
+                lists.list_edges,
+                lists.display_labels,
+                lists.list_x_axis,
+                lists.edges_combined,
+                lists.x_axis_combined,
+                plot_pixel_scales,
+                summary_tables=lists.list_edge_summaries,
+                summary_joint=lists.summary_joint,
+                suptitle=lists.suptitle,
+            )
+            return fig
+        if self.process_individual:
+            fig, _ = self._create_individual_summary_plot(
+                plot_imgs,
+                plot_imgs_original,
+                plot_masks,
+                plot_imgs_components,
+                lists.list_edges,
+                lists.display_labels,
+                lists.list_x_axis,
+                plot_pixel_scales,
+                summary_tables=lists.list_edge_summaries,
+                suptitle=lists.suptitle,
+            )
+            return fig
+        if self.process_joint:
+            if lists.edges_combined is None or lists.x_axis_combined is None:
+                self._set_status("Error: Joint edges unavailable")
+                return None
+            if lists.display_labels and plot_imgs:
+                fig, _ = self._create_joint_summary_with_images(
+                    plot_imgs,
+                    plot_imgs_original,
+                    plot_masks,
+                    plot_imgs_components,
+                    lists.display_labels,
+                    lists.edges_combined,
+                    lists.x_axis_combined,
+                    plot_pixel_scales,
+                    suptitle=lists.suptitle,
+                )
+            else:
+                fig, _ = self._create_joint_summary_plot(
+                    lists.edges_combined,
+                    lists.x_axis_combined,
+                    summary_table=lists.summary_joint,
+                    suptitle=lists.suptitle,
+                )
+            return fig
+        return None
+
+    def _show_processing_results(self, results):
+        """Display the summary plot of a finished run (saving is on export)."""
+        lists = self._collect_run_lists(results)
+        fig = self._build_summary_figure(lists)
+        if fig is not None and self.show_summary_plot:
+            plt.show(block=False)
+        self._set_status("Ready")
+
+    def _export_run_results(self, results):
+        """Write every checked output of *results* to the results folder."""
+        if self.save_deco:
+            self._save_deco_objects(results)
+        if self.save_pickle:
+            self._save_full_pickle(results)
+
+        lists = self._collect_run_lists(results)
+        labels_individual = lists.labels_individual
+        labels_joint = lists.labels_joint
+
         if self.save_colored_images and self.process_individual:
             save_colored_images(
-                list_imgs,
+                lists.list_imgs,
                 labels_individual,
                 os.path.join(self.results_folder, "colored_images"),
             )
-            if list_imgs_components is not None:
-                for comp_idx, comp_imgs in enumerate(list_imgs_components):
+            if lists.list_imgs_components is not None:
+                for comp_idx, comp_imgs in enumerate(
+                    lists.list_imgs_components
+                ):
                     save_component_images(
                         comp_imgs,
                         labels_individual,
@@ -2633,20 +3182,20 @@ class EELSProcessingWidget(QWidget):
 
         if self.save_original_images and self.process_individual:
             save_original_images(
-                list_imgs_original,
+                lists.list_imgs_original,
                 labels_individual,
                 os.path.join(self.results_folder, "original_images"),
             )
 
         if self.save_colored_images and self.process_joint:
             save_colored_images(
-                list_imgs_joint,
+                lists.list_imgs_joint,
                 labels_joint,
                 os.path.join(self.results_folder, "colored_images_joint"),
             )
-            if list_imgs_components_joint is not None:
+            if lists.list_imgs_components_joint is not None:
                 for comp_idx, comp_imgs in enumerate(
-                    list_imgs_components_joint
+                    lists.list_imgs_components_joint
                 ):
                     save_component_images(
                         comp_imgs,
@@ -2658,24 +3207,24 @@ class EELSProcessingWidget(QWidget):
                     )
 
         if self.save_masks and self.process_individual:
-            if list_masks is not None:
+            if lists.list_masks is not None:
                 save_mask_images(
-                    list_masks,
+                    lists.list_masks,
                     labels_individual,
                     os.path.join(self.results_folder, "mask_images"),
                 )
 
         if self.save_masks and self.process_joint:
-            if list_masks_joint is not None:
+            if lists.list_masks_joint is not None:
                 save_mask_images(
-                    list_masks_joint,
+                    lists.list_masks_joint,
                     labels_joint,
                     os.path.join(self.results_folder, "mask_images_joint"),
                 )
 
         if self.save_original_images and self.process_joint:
             save_original_images(
-                list_imgs_original_joint,
+                lists.list_imgs_original_joint,
                 labels_joint,
                 os.path.join(self.results_folder, "original_images_joint"),
             )
@@ -2690,7 +3239,7 @@ class EELSProcessingWidget(QWidget):
                 os.path.join(self.results_folder, "edges_joint"),
             )
             export_edge_contributions_summary_to_csv(
-                summary_joint or [],
+                lists.summary_joint or [],
                 os.path.join(
                     self.results_folder, "edge_contributions_joint.csv"
                 ),
@@ -2708,109 +3257,22 @@ class EELSProcessingWidget(QWidget):
                 self.results_folder, "edge_contributions"
             )
             for label, summary_rows in zip(
-                labels_individual, list_edge_summaries
+                labels_individual, lists.list_edge_summaries
             ):
                 export_edge_contributions_summary_to_csv(
                     summary_rows,
                     os.path.join(summary_dir, f"{label}.csv"),
                 )
 
-        if self.save_summary_plot or self.show_summary_plot:
-            use_joint_images = self.process_joint and bool(list_imgs_joint)
-            plot_imgs = list_imgs_joint if use_joint_images else list_imgs
-            plot_imgs_original = (
-                list_imgs_original_joint
-                if use_joint_images
-                else list_imgs_original
-            )
-            plot_masks = list_masks_joint if use_joint_images else list_masks
-            plot_imgs_components = (
-                list_imgs_components_joint
-                if use_joint_images
-                else list_imgs_components
-            )
-            plot_pixel_scales = list_pixel_scales
-            if (
-                use_joint_images
-                and not plot_pixel_scales
-                and results.joint is not None
-                and display_labels
-            ):
-                plot_pixel_scales = [results.joint.pixel_scale] * len(
-                    display_labels
-                )
-
-            if self.process_individual and self.process_joint:
-                fig, _ = self._create_summary_plot(
-                    plot_imgs,
-                    plot_imgs_original,
-                    plot_masks,
-                    plot_imgs_components,
-                    list_edges,
-                    display_labels,
-                    list_x_axis,
-                    edges_combined,
-                    x_axis_combined,
-                    plot_pixel_scales,
-                    summary_tables=list_edge_summaries,
-                    summary_joint=summary_joint,
-                    suptitle=suptitle,
-                )
-            elif self.process_individual:
-                fig, _ = self._create_individual_summary_plot(
-                    plot_imgs,
-                    plot_imgs_original,
-                    plot_masks,
-                    plot_imgs_components,
-                    list_edges,
-                    display_labels,
-                    list_x_axis,
-                    plot_pixel_scales,
-                    summary_tables=list_edge_summaries,
-                    suptitle=suptitle,
-                )
-            elif self.process_joint:
-                if edges_combined is None or x_axis_combined is None:
-                    self._set_status("Error: Joint edges unavailable")
-                    fig = None
-                elif display_labels and plot_imgs:
-                    fig, _ = self._create_joint_summary_with_images(
-                        plot_imgs,
-                        plot_imgs_original,
-                        plot_masks,
-                        plot_imgs_components,
-                        display_labels,
-                        edges_combined,
-                        x_axis_combined,
-                        plot_pixel_scales,
-                        suptitle=suptitle,
-                    )
-                else:
-                    fig, _ = self._create_joint_summary_plot(
-                        edges_combined,
-                        x_axis_combined,
-                        summary_table=summary_joint,
-                        suptitle=suptitle,
-                    )
-            else:
-                fig = None
-
+        if self.save_summary_plot:
+            fig = self._build_summary_figure(lists)
             if fig is not None:
-                if self.save_summary_plot:
-                    save_summary_plot(
-                        fig,
-                        os.path.join(self.results_folder, "summary.png"),
-                        dpi=300,
-                    )
-
-                import matplotlib.pyplot as plt
-
-                if self.show_summary_plot:
-                    plt.show(block=False)
-                else:
-                    plt.close(fig)
-
-        self._set_status("Ready")
+                save_summary_plot(
+                    fig,
+                    os.path.join(self.results_folder, "summary.png"),
+                    dpi=300,
+                )
+                plt.close(fig)
 
     def _create_summary_plot(
         self,

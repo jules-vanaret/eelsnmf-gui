@@ -84,7 +84,8 @@ class NmfEngine(Protocol):
         tol: float = 1e-8,
         error_skip_step: int = 100,
         decomposition_method: str = "default_decomposition",
-        regularization: float | None = None,
+        regularization_tv: float | None = None,
+        regularization_sr: float | None = None,
         fixed_weights: Tuple[Tuple[str, int, str], ...] | None = None,
     ) -> None: ...
 
@@ -135,7 +136,8 @@ class DecompositionSpec:
     tol: float
     error_skip_step: int
     decomposition_method: str
-    regularization: float | None
+    regularization_tv: float | None
+    regularization_sr: float | None
     fixed_weights: tuple
 
 
@@ -374,7 +376,8 @@ class Session:
         tol: float = 1e-8,
         error_skip_step: int = 100,
         decomposition_method: str = "default_decomposition",
-        regularization: float | None = None,
+        regularization_tv: float | None = None,
+        regularization_sr: float | None = None,
         fixed_weights: Sequence[Tuple[str, int, str]] | None = None,
         force: bool = False,
     ) -> ProcessFoldersResult:
@@ -386,12 +389,15 @@ class Session:
         :class:`DecompositionSpec` unless *force* is set. *use_cupy*
         selects the backend (None auto-detects a CUDA device).
         *n_power_laws* sizes the power-law background grid in G; *tol*,
-        *error_skip_step*, *decomposition_method* and *regularization* are
-        forwarded to the EELSNMF decomposition. *fixed_weights* lists
-        (edge, component, mode) constraints: mode "fixed" freezes the edge's
-        cross-section weight in that component at its initial value, mode
-        "excluded" also zero-fixes its fine-structure channels so the
-        element cannot appear in that component.
+        *error_skip_step* and *decomposition_method* are forwarded to the
+        EELSNMF decomposition. *regularization_tv* is the Total-Variation
+        lambda (EdgeTV, combinedTVSR) and *regularization_sr* the SumRule
+        lambda (SumRule, combinedTVSR); each method receives exactly the
+        lambdas it accepts. *fixed_weights* lists (edge, component, mode)
+        constraints: mode "fixed" freezes the edge's cross-section weight
+        in that component at its initial value, mode "excluded" also
+        zero-fixes its fine-structure channels so the element cannot
+        appear in that component.
         """
         mask = MaskParams() if mask is None else mask
         if not (process_individual or process_joint):
@@ -430,7 +436,8 @@ class Session:
                 tol=tol,
                 error_skip_step=error_skip_step,
                 decomposition_method=decomposition_method,
-                regularization=regularization,
+                regularization_tv=regularization_tv,
+                regularization_sr=regularization_sr,
                 fixed_weights=fixed_weights,
                 force=force,
             )
@@ -465,7 +472,8 @@ class Session:
                     tol=tol,
                     error_skip_step=error_skip_step,
                     decomposition_method=decomposition_method,
-                    regularization=regularization,
+                    regularization_tv=regularization_tv,
+                    regularization_sr=regularization_sr,
                     fixed_weights=fixed_weights,
                     force=force,
                 )
@@ -585,7 +593,8 @@ class Session:
         tol: float,
         error_skip_step: int,
         decomposition_method: str,
-        regularization: float | None,
+        regularization_tv: float | None,
+        regularization_sr: float | None,
         fixed_weights: Sequence[Tuple[str, int, str]] | None,
         force: bool,
     ) -> ProcessingResult:
@@ -606,7 +615,8 @@ class Session:
             tol=tol,
             error_skip_step=error_skip_step,
             decomposition_method=decomposition_method,
-            regularization=regularization,
+            regularization_tv=regularization_tv,
+            regularization_sr=regularization_sr,
             fixed_weights=_fixed_weights_key(fixed_weights),
         )
 
@@ -639,7 +649,8 @@ class Session:
                 tol=tol,
                 error_skip_step=error_skip_step,
                 decomposition_method=decomposition_method,
-                regularization=regularization,
+                regularization_tv=regularization_tv,
+                regularization_sr=regularization_sr,
                 fixed_weights=_fixed_weights_key(fixed_weights),
             )
             self._decompositions[scope] = (spec, bundle)
