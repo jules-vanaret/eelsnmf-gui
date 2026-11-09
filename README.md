@@ -3,34 +3,6 @@
 GUI for [EELS NMF](https://github.com/PauTorru/EELSNMF) processing, including a standalone Qt GUI and
 a scriptable processing API for scripts and batch workflows.
 
-## Features
-
-- Qt GUI for end-to-end EELS NMF workflows (preprocess, masking, decomposition,
-	plotting, exports).
-- `Session` API (`src/eelsnmf_gui/session.py`) exposing the same pipeline
-	stages for scripted usage outside the GUI.
-- Stage-wise caching: preprocessing, masks, and fitted decompositions are
-	reused and invalidated automatically when their inputs change.
-
-## Design Notes
-
-- The pipeline is split into explicit stages: preprocessing (folder loading,
-	ZLP alignment, despiking, common energy axis), mask building, model
-	building and decomposition, and result analysis (edges, maps, summaries).
-- `eelsnmf_gui.session.Session` owns the folders and parameters, caches each
-	stage, and self-invalidates:
-	- changing folders or the median filter size invalidates everything;
-	- changing mask parameters invalidates masks and decompositions, but
-		keeps preprocessing;
-	- changing decomposition parameters (beam, edge ranges, number of
-		components, max iterations, W init) invalidates decompositions only;
-	- colors never affect the decomposition: recoloring only re-renders.
-- The EELSNMF backend is isolated behind a loader and an engine interface, so
-	all other stages run on plain numpy arrays and are testable without
-	EELSNMF installed.
-- The GUI is a thin wrapper around the `Session`, keeping behavior consistent
-	between interactive and scripted runs.
-
 ## Installation
 
 Install the EELSNMF backend from source:
@@ -51,7 +23,7 @@ If you want GPU support, make sure to install [cupy](https://docs.cupy.dev/en/st
 conda install -c conda-forge cupy
 ```
 
-## Run the GUI:
+## How to run the GUI:
 
 Using the console entry point:
 ```
@@ -69,6 +41,15 @@ or calling the script directly (make sure to run from the package root):
 ```
 python run_gui.py
 ```
+
+## Features
+
+- Qt GUI for end-to-end EELS NMF workflows (preprocess, masking, decomposition,
+	plotting, exports).
+- `Session` API (`src/eelsnmf_gui/session.py`) exposing the same pipeline
+	stages for scripted usage outside the GUI.
+- Stage-wise caching: preprocessing, masks, and fitted decompositions are
+	reused and invalidated automatically when their inputs change.
 
 ## Testing
 
