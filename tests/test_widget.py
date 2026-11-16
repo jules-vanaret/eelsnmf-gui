@@ -442,6 +442,50 @@ def test_power_laws_slider(qtbot):
     assert widget.n_power_laws == 50
 
 
+def test_power_laws_slider_lives_in_processing_section(qtbot):
+    """The power-law count is a processing parameter, not a structure one."""
+    from qtpy.QtWidgets import QApplication, QGroupBox
+
+    widget = EELSProcessingWidget(debug=True)
+    qtbot.addWidget(widget)
+    widget.resize(1200, 800)
+    widget.show()
+    QApplication.processEvents()
+
+    assert widget.processing_group.isAncestorOf(widget.power_laws_slider)
+    structure_group = next(
+        g
+        for g in widget.findChildren(QGroupBox)
+        if g.title() == "Fine Structure Definition"
+    )
+    assert not structure_group.isAncestorOf(widget.power_laws_slider)
+
+
+def test_browse_button_has_input_help(qtbot):
+    """A help button next to Browse explains the accepted inputs."""
+    widget = EELSProcessingWidget(debug=True)
+    qtbot.addWidget(widget)
+    from qtpy.QtWidgets import QToolButton
+
+    from eelsnmf_gui._widget import HelpButton
+
+    # The help button sits in the same row as the Browse button.
+    buttons = [
+        b
+        for b in widget.folder_button.parent().findChildren(HelpButton)
+        if b.text() == "?"
+    ]
+    assert len(buttons) == 1
+    tooltip = buttons[0].toolTip()
+    assert "STEM SI.dm4" in tooltip
+    assert ".pkl" in tooltip
+    # The existing help buttons still carry their tooltips.
+    all_help = [
+        b for b in widget.findChildren(QToolButton) if b.text() == "?"
+    ]
+    assert len(all_help) >= 10
+
+
 def test_add_edge_button_label(qtbot):
     """The fine-structure button is labelled 'Add edge'."""
     widget = EELSProcessingWidget(debug=True)

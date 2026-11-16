@@ -396,6 +396,16 @@ class EELSProcessingWidget(QWidget):
         self.folder_button.clicked.connect(self._select_folder)
         folder_layout.addWidget(self.folder_label)
         folder_layout.addWidget(self.folder_button)
+        folder_layout.addWidget(
+            self._make_help_button(
+                "Accepted inputs:\n"
+                "- one or more folders, each containing a\n"
+                "  'STEM SI.dm4' spectrum image (jointly or individually\n"
+                "  processed, depending on the processing mode);\n"
+                "- or a single deco file (.pkl) saved by EELSNMF, to\n"
+                "  visualize and re-export its results."
+            )
+        )
         input_layout.addLayout(folder_layout)
 
         input_group.setLayout(input_layout)
@@ -575,32 +585,6 @@ class EELSProcessingWidget(QWidget):
         )
         ranges_buttons_layout.addStretch()
         structure_layout.addLayout(ranges_buttons_layout)
-
-        # Number of power-law backgrounds in the spectral model (G)
-        power_laws_layout = QHBoxLayout()
-        power_laws_layout.addWidget(QLabel("Number of power laws:"))
-        # Quadratic progression: fine control at small counts, quick access
-        # to the large ones.
-        self.power_laws_slider = MappedSlider(
-            1,
-            500,
-            to_value=lambda frac: round(1 + 499 * frac * frac),
-            to_position=lambda v: ((v - 1) / 499) ** 0.5,
-            n_positions=1000,
-            fmt=lambda v: str(int(round(v))),
-        )
-        self.power_laws_slider.setValue(self.n_power_laws)
-        self.power_laws_slider.valueChanged.connect(
-            self._on_n_power_laws_changed
-        )
-        power_laws_layout.addWidget(self.power_laws_slider, stretch=1)
-        power_laws_layout.addWidget(
-            self._make_help_button(
-                "Number of power-law backgrounds used to fit the "
-                "background signal (exponents spanning 0.5-8)."
-            )
-        )
-        structure_layout.addLayout(power_laws_layout)
 
         # Fixed weights: pin an element's cross-section weight to a component
         fixed_header = QHBoxLayout()
@@ -821,6 +805,32 @@ class EELSProcessingWidget(QWidget):
         )
         processing_layout.addLayout(components_layout)
 
+        # Number of power-law backgrounds in the spectral model (G)
+        power_laws_layout = QHBoxLayout()
+        power_laws_layout.addWidget(QLabel("Number of power laws:"))
+        # Quadratic progression: fine control at small counts, quick access
+        # to the large ones.
+        self.power_laws_slider = MappedSlider(
+            1,
+            500,
+            to_value=lambda frac: round(1 + 499 * frac * frac),
+            to_position=lambda v: ((v - 1) / 499) ** 0.5,
+            n_positions=1000,
+            fmt=lambda v: str(int(round(v))),
+        )
+        self.power_laws_slider.setValue(self.n_power_laws)
+        self.power_laws_slider.valueChanged.connect(
+            self._on_n_power_laws_changed
+        )
+        power_laws_layout.addWidget(self.power_laws_slider, stretch=1)
+        power_laws_layout.addWidget(
+            self._make_help_button(
+                "Number of power-law backgrounds used to fit the "
+                "background signal (exponents spanning 0.5-8)."
+            )
+        )
+        processing_layout.addLayout(power_laws_layout)
+
         mode_layout = QHBoxLayout()
         mode_layout.addWidget(QLabel("Process folders:"))
         mode_layout.addStretch()
@@ -887,6 +897,7 @@ class EELSProcessingWidget(QWidget):
 
         processing_group.setLayout(processing_layout)
         middle_column_layout.addWidget(processing_group)
+        self.processing_group = processing_group
 
         # Run button and status
         run_layout = QHBoxLayout()
