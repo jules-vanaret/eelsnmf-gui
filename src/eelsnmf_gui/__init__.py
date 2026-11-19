@@ -5,6 +5,8 @@ try:
 except PackageNotFoundError:  # running from source without installation
     __version__ = "unknown"
 
+from ._nmf import cupy_gpu_available
+from ._preprocess import load_eml_folders
 from ._results import (
     BeamParams,
     DecoBundle,
@@ -35,4 +37,6 @@ __all__ = (
     "EdgeCollection",
     "EdgeSeries",
     "ImageCollection",
+    "load_eml_folders",
+    "cupy_gpu_available",
 )

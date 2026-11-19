@@ -99,6 +99,41 @@ def test_session_rejects_empty_folders():
         Session([])
 
 
+def test_session_rejects_unknown_despike_method(two_folders):
+    """Only the EML and Hampel despiking algorithms are accepted."""
+    with pytest.raises(ValueError):
+        Session(two_folders, despike_method="median")
+
+
+def test_session_despike_method_configures_default_loader(
+    monkeypatch, two_folders
+):
+    """The Session despike_method is forwarded to the default loader."""
+    import eelsnmf_gui.session as session_module
+
+    captured = {}
+    loader = FakeLoader()
+
+    def fake_load_eml_folders(
+        folders, labels, *, median_filter_size, despike_method="eml"
+    ):
+        captured["despike_method"] = despike_method
+        return loader(folders, labels, median_filter_size)
+
+    monkeypatch.setattr(
+        session_module, "load_eml_folders", fake_load_eml_folders
+    )
+    session = Session(
+        two_folders,
+        despike_method="hampel",
+        engine=StubEngine(),
+    )
+    assert session.despike_method == "hampel"
+
+    session.preprocessed()
+    assert captured["despike_method"] == "hampel"
+
+
 # ---------------------------------------------------------------------------
 # masks
 # ---------------------------------------------------------------------------

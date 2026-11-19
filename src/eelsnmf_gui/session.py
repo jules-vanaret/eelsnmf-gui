@@ -4,6 +4,7 @@ import logging
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import (
     Dict,
     List,
@@ -152,6 +153,10 @@ class Session:
     - fitted decompositions are cached per :class:`DecompositionSpec`
       (colors are *not* part of the spec: recoloring only re-renders).
 
+    *despike_method* selects the default loader's despiking algorithm
+    (``"eml"`` or ``"hampel"``) when *loader* is not given. A custom
+    *loader* is responsible for its own preprocessing.
+
     The GUI may call ``run`` from a worker thread while diagnostic accessors
     run on the UI thread; like the previous implementation, thread safety
     relies on GIL-level guarantees only.
@@ -162,16 +167,29 @@ class Session:
         folders: Sequence[str],
         *,
         median_filter_size: int = 11,
+        despike_method: str = "eml",
         loader: Loader | None = None,
         engine: NmfEngine | None = None,
         progress: Callable[[str], None] | None = None,
     ):
         if len(folders) == 0:
             raise ValueError("No source folders provided")
+        if despike_method not in ("eml", "hampel"):
+            raise ValueError(
+                f"Unknown despike method: {despike_method!r}; expected "
+                "'eml' or 'hampel'"
+            )
         self._folders = tuple(folders)
         self._labels = [os.path.basename(folder) for folder in self._folders]
         self._median_filter_size = int(median_filter_size)
-        self._loader: Loader = loader if loader is not None else load_eml_folders
+        self._despike_method = str(despike_method)
+        self._loader: Loader = (
+            loader
+            if loader is not None
+            else partial(
+                load_eml_folders, despike_method=self._despike_method
+            )
+        )
         self._engine: NmfEngine = engine if engine is not None else _default_engine()
         self._progress = progress
 
@@ -192,6 +210,10 @@ class Session:
     @property
     def median_filter_size(self) -> int:
         return self._median_filter_size
+
+    @property
+    def despike_method(self) -> str:
+        return self._despike_method
 
     def set_folders(self, folders: Sequence[str]) -> None:
         if len(folders) == 0:
